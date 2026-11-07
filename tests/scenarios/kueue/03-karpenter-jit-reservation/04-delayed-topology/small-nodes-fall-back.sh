@@ -2,14 +2,17 @@
 # Kind has no Karpenter: simulate registration of nodes too small for the gang's topology.
 # Packing sizes the claims from pod requests; TAS then finds no room on the registered nodes.
 set -euo pipefail
+. ./bounded-waits.sh
 cleanup() {
-  rc=$?
-  if [ "$rc" != 0 ]; then
+  initial_status=$?
+  rc=0
+  if [ "$initial_status" != 0 ]; then
     kubectl -n "$NS" get workloads,pods -o yaml >&2 || true
     kubectl get nodeclaims -o yaml >&2 || true
   fi
   ./finish-job.sh delayed-tas-small-gang || rc=$?
-  kubectl delete node -l "example.com/delayed-tas-test=$NS" --ignore-not-found >/dev/null
+  kubectl delete node -l "example.com/delayed-tas-test=$NS" --ignore-not-found --timeout=10s >/dev/null || rc=$?
+  if [ "$initial_status" != 0 ]; then return "$initial_status"; fi
   return "$rc"
 }
 trap cleanup EXIT
@@ -20,11 +23,11 @@ heartbeat() {
   done
 }
 # Wait for the preceding gang's claims to be cleaned up.
-until [ "$(kubectl get nodeclaims -l "$selector" -o json | jq '.items | length')" = 0 ]; do sleep 1; done
+wait_for_count 0 get nodeclaims -l "$selector"
 sed -e 's/name: delayed-tas-gang/name: delayed-tas-small-gang/' -e 's/queue-name: delayed-tas$/queue-name: delayed-tas-fallback/' 01-job.yaml | kubectl -n "$NS" create -f -
-until [ "$(kubectl get nodeclaims -l "$selector" -o json | jq '.items | length')" = 2 ]; do sleep 1; done
+wait_for_count 3 get nodeclaims -l "$selector"
 wl=$(kubectl get nodeclaims -l "$selector" -o json | jq -r '.items[0].metadata.labels["kueue.x-k8s.io/workload"]')
-# Register both claims on nodes that advertise 100m CPU, below one 250m pod.
+# Register all claims on nodes that advertise 100m CPU, below one 250m pod.
 for nc in $(kubectl get nodeclaims -l "$selector" -o name); do
   node="tas-small-${nc#*/}"
   kubectl get "$nc" -o json | jq --arg name "$node" --arg ns "$NS" '{
@@ -36,7 +39,8 @@ for nc in $(kubectl get nodeclaims -l "$selector" -o name); do
   kubectl patch "$nc" --subresource=status --type=merge -p "$(jq -nc --arg node "$node" '{status:{nodeName:$node,conditions:[{type:"Launched",status:"True",reason:"Launched",message:"",lastTransitionTime:"2026-01-01T00:00:00Z"},{type:"Registered",status:"True",reason:"Registered",message:"",lastTransitionTime:"2026-01-01T00:00:00Z"}]}}')"
 done
 # Registration turns the check Ready, but TAS cannot place the gang, so the topology stays Pending.
-for i in $(seq 1 30); do
+deadline=$(($(date +%s) + 30))
+while [ "$(date +%s)" -lt "$deadline" ]; do
   heartbeat
   if kubectl -n "$NS" get workload "$wl" -o json | jq -e 'any(.status.admissionChecks[]; .state == "Ready")' >/dev/null; then break; fi
   sleep 1
@@ -47,7 +51,8 @@ kubectl -n "$NS" get workload "$wl" -o json | jq -e '
   .status.admission.podSetAssignments[0].flavors.cpu == "delayed-tas-karpenter" and
   .status.admission.podSetAssignments[0].delayedTopologyRequest == "Pending"'
 # The launch deadline keeps running: the claims are released and the workload moves to the reserved flavor.
-for i in $(seq 1 90); do
+deadline=$(($(date +%s) + 90))
+while [ "$(date +%s)" -lt "$deadline" ]; do
   heartbeat
   if kubectl -n "$NS" get workload "$wl" -o json | jq -e '
       any(.status.conditions[]; .type == "Admitted" and .status == "True") and
