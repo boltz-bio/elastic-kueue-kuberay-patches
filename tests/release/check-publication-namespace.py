@@ -1,5 +1,6 @@
 """Verify resolved publication ownership and actual publish-task arguments without building images or contacting a registry."""
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -8,12 +9,19 @@ import tempfile
 import tomllib
 
 
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--expected-repository", required=True)
+parser.add_argument("--expected-owner", required=True)
+arguments = parser.parse_args()
+
 ROOT = Path(__file__).resolve().parents[2]
 config = tomllib.loads((ROOT / "mise.toml").read_text())
 repository = os.environ.get(
     "GITHUB_REPOSITORY", "boltz-bio/elastic-kueue-kuberay-patches"
 )
 owner = os.environ.get("GITHUB_REPOSITORY_OWNER", "boltz-bio")
+assert repository == arguments.expected_repository
+assert owner == arguments.expected_owner
 assert os.environ["PUBLISH_REPOSITORY"] == repository
 assert os.environ["PUBLISH_OWNER"] == owner
 wheel_url = (

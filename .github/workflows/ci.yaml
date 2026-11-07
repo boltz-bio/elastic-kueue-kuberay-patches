@@ -20,13 +20,10 @@ jobs:
         uses: jdx/mise-action@v5
 
       - name: Check Local Publication Defaults
-        run: env -u GITHUB_REPOSITORY -u GITHUB_REPOSITORY_OWNER mise exec -- python3 tests/release/check-publication-namespace.py
+        run: env -u GITHUB_REPOSITORY -u GITHUB_REPOSITORY_OWNER mise exec -- python3 tests/release/check-publication-namespace.py --expected-repository boltz-bio/elastic-kueue-kuberay-patches --expected-owner boltz-bio
 
       - name: Check Repository and Registry Ownership
-        env:
-          GITHUB_REPOSITORY: example-owner/example-project
-          GITHUB_REPOSITORY_OWNER: example-registry
-        run: mise exec -- python3 tests/release/check-publication-namespace.py
+        run: env GITHUB_REPOSITORY=example-owner/example-project GITHUB_REPOSITORY_OWNER=example-registry mise exec -- python3 tests/release/check-publication-namespace.py --expected-repository example-owner/example-project --expected-owner example-registry
 
   validate-patches:
     name: Validate Upstream Patch Rebase
