@@ -499,6 +499,9 @@ subjects:
   namespace: kueue-system
 EOF
 
+# Apply the patched generated manager role, which can add permissions absent from the upstream release.
+bash tests/setup/install-kueue-rbac.sh
+
 # Patch 0007 re-stamps the templates of an elastic RayCluster on every write, so its webhook must also see updates;
 # the release manifests register it for CREATE only.
 raycluster_webhook=$(kubectl get mutatingwebhookconfiguration kueue-mutating-webhook-configuration -o jsonpath='{.webhooks[*].name}' |
