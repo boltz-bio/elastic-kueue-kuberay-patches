@@ -64,7 +64,7 @@ jobs:
           ]
           anonymous = {key: value for key, value in os.environ.items() if key not in {'GH_TOKEN', 'GITHUB_TOKEN'}}
           anonymous['DOCKER_CONFIG'] = os.environ['RUNNER_TEMP'] + '/baseline-anonymous'
-          proof = {'source_rebuild': False, 'copies': [], 'public_access': [], 'repository': os.environ['GITHUB_REPOSITORY'], 'workflow_sha': os.environ['GITHUB_SHA']}
+          proof = {'source_rebuild': False, 'copies': [], 'copy_errors': [], 'public_access': [], 'public_errors': [], 'repository': os.environ['GITHUB_REPOSITORY'], 'workflow_sha': os.environ['GITHUB_SHA']}
           path = Path('baseline-proof/proof.json')
           def seal():
               path.write_text(json.dumps(proof, indent=2) + '\n')
@@ -79,43 +79,61 @@ jobs:
           for image, tag, digest in rows:
               source = f'ghcr.io/simonepri/{image}@sha256:{digest}'
               destination = f'ghcr.io/boltz-bio/{image}:{tag}'
-              assert crane('digest', source, anon=True) == 'sha256:' + digest
-              source_manifest = manifest(source, digest, anon=True)
-              subprocess.run(['crane', 'copy', '--no-clobber', source, destination], check=True)
-              assert crane('digest', destination) == 'sha256:' + digest
-              assert manifest(destination, digest) == source_manifest
-              # Copy preserves an image's config/layers or an index's complete child closure.
-              descriptors = source_manifest.get('manifests', [])
-              blobs = ([source_manifest['config']['digest'], *[layer['digest'] for layer in source_manifest['layers']]]
-                       if 'config' in source_manifest else [])
-              proof['copies'].append({'source': source, 'destination': destination, 'digest': 'sha256:' + digest, 'manifest_equal': True, 'manifest_sha256_verified': True, 'config_and_layers': blobs, 'child_manifests': descriptors})
+              try:
+                  assert crane('digest', source, anon=True) == 'sha256:' + digest
+                  source_manifest = manifest(source, digest, anon=True)
+                  descriptors = source_manifest.get('manifests', [])
+                  # Retain each exact platform and attestation manifest through its own named operation.
+                  for child in descriptors:
+                      child_source = f'ghcr.io/simonepri/{image}@{child["digest"]}'
+                      child_destination = f'ghcr.io/boltz-bio/{image}:{tag}-manifest-{child["digest"].split(":")[1][:12]}'
+                      original = manifest(child_source, child['digest'], anon=True)
+                      subprocess.run(['crane', 'copy', '--no-clobber', child_source, child_destination], check=True)
+                      assert crane('digest', child_destination) == child['digest']
+                      assert manifest(child_destination, child['digest']) == original
+                  subprocess.run(['crane', 'copy', '--no-clobber', source, destination], check=True)
+                  assert crane('digest', destination) == 'sha256:' + digest
+                  assert manifest(destination, digest) == source_manifest
+                  blobs = ([source_manifest['config']['digest'], *[layer['digest'] for layer in source_manifest['layers']]]
+                           if 'config' in source_manifest else [])
+                  proof['copies'].append({'source': source, 'destination': destination, 'digest': 'sha256:' + digest, 'manifest_equal': True, 'manifest_sha256_verified': True, 'config_and_layers': blobs, 'child_manifests': descriptors})
+              except Exception as error:
+                  proof['copy_errors'].append({'source': source, 'destination': destination, 'error': str(error)})
               seal()
           first = 'ghcr.io/boltz-bio/ray@sha256:' + rows[0][2]
           second = 'ghcr.io/boltz-bio/ray@sha256:' + rows[1][2]
           cpu = 'ghcr.io/boltz-bio/ray:2.60.0-py313-p0.4.3'
-          existing = subprocess.run(['crane', 'manifest', cpu], capture_output=True, text=True, check=False)
-          if existing.returncode:
-              if not any(code in existing.stderr for code in ('MANIFEST_UNKNOWN', 'NAME_UNKNOWN')):
-                  raise RuntimeError(existing.stderr)
-              subprocess.run(['crane', 'index', 'append', '--manifest', first, '--manifest', second, '--tag', cpu], check=True)
-          # An existing CPU index is only read and accepted if it already contains the exact baseline children.
-          index_digest = crane('digest', cpu)
-          index = manifest(cpu, index_digest)
-          assert {item['digest'] for item in index['manifests']} == {'sha256:' + rows[0][2], 'sha256:' + rows[1][2]}
-          assert {(item['platform']['os'], item['platform']['architecture']) for item in index['manifests']} == {('linux', 'amd64'), ('linux', 'arm64')}
-          proof['cpu_index'] = {'reference': cpu, 'digest': index_digest, 'recomposed': True, 'children': index['manifests'], 'manifest_sha256_verified': True}
-          proof['authenticated_copy_passed'] = True
+          try:
+              existing = subprocess.run(['crane', 'manifest', cpu], capture_output=True, text=True, check=False)
+              if existing.returncode:
+                  if not any(code in existing.stderr for code in ('MANIFEST_UNKNOWN', 'NAME_UNKNOWN')):
+                      raise RuntimeError(existing.stderr)
+                  subprocess.run(['crane', 'index', 'append', '--manifest', first, '--manifest', second, '--tag', cpu], check=True)
+              # An existing CPU index is read and accepted only with the exact baseline children.
+              index_digest = crane('digest', cpu)
+              index = manifest(cpu, index_digest)
+              assert {item['digest'] for item in index['manifests']} == {'sha256:' + rows[0][2], 'sha256:' + rows[1][2]}
+              assert {(item['platform']['os'], item['platform']['architecture']) for item in index['manifests']} == {('linux', 'amd64'), ('linux', 'arm64')}
+              proof['cpu_index'] = {'reference': cpu, 'digest': index_digest, 'recomposed': True, 'children': index['manifests'], 'manifest_sha256_verified': True}
+          except Exception as error:
+              proof['copy_errors'].append({'destination': cpu, 'error': str(error)})
+          proof['authenticated_copy_passed'] = not proof['copy_errors'] and len(proof['copies']) == len(rows)
           seal()
           # Visibility is independent of repository permissions. Fail closed until consumers can read anonymously.
-          for row in proof['copies']:
-              assert crane('digest', row['destination'], anon=True) == row['digest']
-              proof['public_access'].append(row['destination'])
+          public_rows = [(row['destination'], row['digest']) for row in proof['copies']]
+          if 'cpu_index' in proof:
+              public_rows.append((cpu, proof['cpu_index']['digest']))
+          for destination, digest in public_rows:
+              try:
+                  assert crane('digest', destination, anon=True) == digest
+                  proof['public_access'].append(destination)
+              except Exception as error:
+                  proof['public_errors'].append({'destination': destination, 'error': str(error)})
               seal()
-          assert crane('digest', cpu, anon=True) == proof['cpu_index']['digest']
-          proof['public_access'].append(cpu)
-          proof['result'] = 'PASS'
+          proof['result'] = 'FAIL' if proof['copy_errors'] or proof['public_errors'] else 'PASS'
           proof['finished_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
           seal()
+          raise SystemExit(0 if proof['result'] == 'PASS' else 1)
           PY
 
       - name: Record scoped package metadata
