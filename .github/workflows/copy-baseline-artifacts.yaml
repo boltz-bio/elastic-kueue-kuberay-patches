@@ -18,13 +18,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      DOCKER_CONFIG: ${{ runner.temp }}/baseline-registry-auth
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Install the checksum-pinned native registry client
         run: |
           set -euo pipefail
           tools="${RUNNER_TEMP}/baseline-tools"
+          export DOCKER_CONFIG="${RUNNER_TEMP}/baseline-registry-auth"
+          printf 'DOCKER_CONFIG=%s\n' "${DOCKER_CONFIG}" >> "${GITHUB_ENV}"
           mkdir -p "${tools}" "${DOCKER_CONFIG}" "${RUNNER_TEMP}/baseline-anonymous"
           chmod 700 "${DOCKER_CONFIG}"
           printf '{}\n' > "${RUNNER_TEMP}/baseline-anonymous/config.json"
@@ -129,7 +130,7 @@ jobs:
 
       - name: Remove ephemeral registry credentials
         if: always()
-        run: rm -rf -- "${DOCKER_CONFIG}"
+        run: rm -rf -- "${RUNNER_TEMP}/baseline-registry-auth"
 
       - name: Retain exact transfer evidence
         if: always()
