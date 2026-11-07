@@ -22,9 +22,9 @@ heartbeat() {
 # Wait for the preceding gang's claims to be cleaned up.
 until [ "$(kubectl get nodeclaims -l "$selector" -o json | jq '.items | length')" = 0 ]; do sleep 1; done
 sed -e 's/name: delayed-tas-gang/name: delayed-tas-small-gang/' -e 's/queue-name: delayed-tas$/queue-name: delayed-tas-fallback/' 01-job.yaml | kubectl -n "$NS" create -f -
-until [ "$(kubectl get nodeclaims -l "$selector" -o json | jq '.items | length')" = 2 ]; do sleep 1; done
+until [ "$(kubectl get nodeclaims -l "$selector" -o json | jq '.items | length')" = 3 ]; do sleep 1; done
 wl=$(kubectl get nodeclaims -l "$selector" -o json | jq -r '.items[0].metadata.labels["kueue.x-k8s.io/workload"]')
-# Register both claims on nodes that advertise 100m CPU, below one 250m pod.
+# Register all claims on nodes that advertise 100m CPU, below one 250m pod.
 for nc in $(kubectl get nodeclaims -l "$selector" -o name); do
   node="tas-small-${nc#*/}"
   kubectl get "$nc" -o json | jq --arg name "$node" --arg ns "$NS" '{

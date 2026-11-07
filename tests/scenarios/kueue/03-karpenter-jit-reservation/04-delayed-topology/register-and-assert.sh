@@ -15,10 +15,10 @@ cleanup() {
   return "$rc"
 }
 trap cleanup EXIT
-until [ "$(kubectl get nodeclaims -l "$selector" -o json | jq '.items | length')" = 2 ]; do sleep 1; done
+until [ "$(kubectl get nodeclaims -l "$selector" -o json | jq '.items | length')" = 3 ]; do sleep 1; done
 claims=$(kubectl get nodeclaims -l "$selector" -o json)
-# Packing is 2+1 pods at 250m each, from a 1 CPU bound and the default fill fraction 0.5.
-echo "$claims" | jq -e '([.items[].metadata.annotations["kueue.x-k8s.io/karpenter-pods"]] | sort) == ["1","2"]'
+# Half of 1 CPU minus Kind's 100m daemon request fits one 250m pod per claim.
+echo "$claims" | jq -e '([.items[].metadata.annotations["kueue.x-k8s.io/karpenter-pods"]] | sort) == ["1","1","1"]'
 wl=$(echo "$claims" | jq -r '.items[0].metadata.labels["kueue.x-k8s.io/workload"]')
 attempt=$(echo "$claims" | jq -r '.items[0].metadata.labels["kueue.x-k8s.io/karpenter-attempt"]')
 assert_pending() {
@@ -43,7 +43,7 @@ for nc in $(echo "$claims" | jq -r '.items[].metadata.name'); do
     })}, spec:{taints:.spec.taints}
   }' | kubectl create -f -
   # Advertise the instance's CPU capacity, leaving room for Kind's DaemonSets.
-  # TAS may pack more densely than the conservative 2+1 claim requests.
+  # TAS may pack more densely than the conservative one-pod claim requests.
   kubectl patch node "$node" --subresource=status --type=merge -p "$(jq -nc --arg cpu "1" '{status:{capacity:{cpu:$cpu,memory:"1Gi",pods:"10"},allocatable:{cpu:$cpu,memory:"1Gi",pods:"10"},conditions:[{type:"Ready",status:"True",reason:"KubeletReady",message:"simulated kubelet"}]}}')"
   kubectl patch nodeclaim "$nc" --subresource=status --type=merge -p "$(jq -nc --arg node "$node" '{status:{nodeName:$node,conditions:[{type:"Launched",status:"True",reason:"Launched",message:"",lastTransitionTime:"2026-01-01T00:00:00Z"},{type:"Registered",status:"True",reason:"Registered",message:"",lastTransitionTime:"2026-01-01T00:00:00Z"}]}}')"
 done
@@ -66,7 +66,7 @@ kubectl -n "$NS" get workload "$wl" -o json | jq -L . -e --arg attempt "$attempt
   all(.status.admission.podSetAssignments[0].topologyAssignment.domains[]; .values[-1] | startswith("tas-")) and
   any(.status.admissionChecks[].podSetUpdates[]; .nodeSelector["kueue.x-k8s.io/karpenter-attempt"] == $attempt and any(.tolerations[]; .key == "karpenter.sh/claimed-by" and .value == $wl and .operator == "Equal"))'
 kubectl -n "$NS" get pods -l job-name=delayed-tas-gang -o json | jq -e '(.items | length) == 3 and all(.items[]; (.spec.nodeName // "" | startswith("tas-")))'
-kubectl get nodes -l "example.com/delayed-tas-test=$NS" -o json | jq -e --arg wl "$wl" '(.items | length) == 2 and all(.items[]; any(.spec.taints[]; .key == "karpenter.sh/claimed-by" and .value == $wl and .effect == "NoSchedule"))'
+kubectl get nodes -l "example.com/delayed-tas-test=$NS" -o json | jq -e --arg wl "$wl" '(.items | length) == 3 and all(.items[]; any(.spec.taints[]; .key == "karpenter.sh/claimed-by" and .value == $wl and .effect == "NoSchedule"))'
 kubectl -n "$NS" wait pod rogue --for=condition=PodScheduled=False --timeout=15s
 kubectl -n "$NS" get pod rogue -o json | jq -e '(.spec.nodeName // "") == "" and any(.status.conditions[]; .type == "PodScheduled" and .status == "False" and (.message | contains("untolerated taint")))'
 # Every bound pod is on one of the domains actually assigned by TAS.
