@@ -124,22 +124,69 @@ fixtures = [
         False,
     ),
 ]
-checked = []
-for workflow in WORKFLOWS:
-    filename = workflow.name
-    source = workflow.read_text()
+
+
+def check_source(filename: str, source: str) -> list[str]:
+    """Reject unsupported declaration forms before finding every guarded write job."""
+    for line in source.splitlines():
+        if line and not line[0].isspace() and not line.startswith("#"):
+            assert re.match(r"[a-zA-Z_][\w-]*:", line), "Unsupported workflow key"
     default = re.search(r"^permissions:\n((?:  [^\n]+\n)+)", source, re.M)
     assert default and default.group(1) == "  contents: read\n"
+    assert len(re.findall(r"^jobs:$", source, re.M)) == 1
+    assert not re.search(r"^\s*<<\s*:", source, re.M), "YAML merge keys are unsupported"
+    job_source = source.split("\njobs:\n", 1)[1]
+    for line in job_source.splitlines():
+        if (
+            line.startswith("  ")
+            and not line.startswith("   ")
+            and line.strip()
+            and not line.lstrip().startswith("#")
+        ):
+            assert re.fullmatch(r"  [a-zA-Z_][\w-]*:", line), (
+                "Unsupported job declaration"
+            )
     for action in re.findall(r"\buses: ([^\s]+)", source):
         assert action.startswith("./") or re.fullmatch(r"[^@]+@[0-9a-f]{40}", action)
+    consumed_permissions = 1  # The explicit read-only workflow default above.
+    checked = []
     for match in re.finditer(
         r"^  ([a-zA-Z_][\w-]*):\n(.*?)(?=^  [a-zA-Z_][\w-]*:\n|\Z)",
-        source,
+        job_source,
         re.M | re.S,
     ):
         job, body = match.groups()
-        permissions = re.search(r"^    permissions:\n((?:      [^\n]+\n)+)", body, re.M)
-        if permissions is None or ": write" not in permissions.group(1):
+        for line in body.splitlines():
+            if (
+                line.startswith("    ")
+                and not line.startswith("     ")
+                and line.strip()
+                and not line.lstrip().startswith("#")
+            ):
+                assert re.match(r"    [a-zA-Z_][\w-]*:", line), "Unsupported job key"
+        declarations = re.findall(
+            r"^    (?:permissions|[\"']permissions[\"'])\s*:[^\n]*$", body, re.M
+        )
+        assert len(declarations) <= 1, "Duplicate job permission declarations"
+        if not declarations:
+            continue
+        assert declarations == ["    permissions:"], (
+            "Unsupported permission declaration"
+        )
+        permissions = re.search(
+            r"^    permissions:\n((?:      [^\n]*\n|[ \t]*\n)+)", body, re.M
+        )
+        assert permissions, "Missing permission mapping"
+        scopes = []
+        for line in permissions.group(1).splitlines():
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            entry = re.fullmatch(r"      [a-z][a-z-]*: (read|write|none)", line)
+            assert entry, "Unsupported permission mapping value"
+            scopes.append(entry.group(1))
+        assert scopes
+        consumed_permissions += 1
+        if "write" not in scopes:
             continue
         condition = re.search(r"^    if: \$\{\{ (.+) \}\}$", body, re.M)
         assert condition, (filename, job, "write job lacks an event guard")
@@ -152,7 +199,6 @@ for workflow in WORKFLOWS:
                 "github.event_name": event,
             }
             assert evaluate(condition, context) == expected, (filename, job, name)
-        # Prove the branch-negative fixture observes a removed main-branch guard.
         weaker = condition.replace("github.ref == 'refs/heads/main'", "true")
         assert weaker != condition
         context = {
@@ -167,13 +213,72 @@ for workflow in WORKFLOWS:
             "ineffective negative control",
         )
         checked.append(f"{filename}:{job}")
+    declarations = re.findall(
+        r"^\s*(?:permissions|[\"']permissions[\"'])\s*:", source, re.M
+    )
+    assert len(declarations) == consumed_permissions, (
+        "Unconsumed permission declaration"
+    )
+    return checked
+
+
+sources = {workflow.name: workflow.read_text() for workflow in WORKFLOWS}
+checked = [
+    job
+    for filename, source in sources.items()
+    for job in check_source(filename, source)
+]
 assert checked
+filename, job = checked[0].split(":", 1)
+source = sources[filename]
+pattern = r"^  " + re.escape(job) + r":\n.*?(?=^  [a-zA-Z_][\w-]*:\n|\Z)"
+block = re.search(pattern, source, re.M | re.S).group()
+unguarded = re.sub(r"^    if:.*\n", "", block, count=1, flags=re.M)
+permissions = re.search(
+    r"^    permissions:\n((?:      [^\n]*\n)+)", unguarded, re.M
+).group()
+mutations = {
+    "unguarded-block-permissions": unguarded,
+    "unguarded-inline-permissions": unguarded.replace(
+        permissions, "    permissions: {contents: read, packages: write}\n"
+    ),
+    "unguarded-write-all": unguarded.replace(
+        permissions, "    permissions: write-all\n"
+    ),
+    "unguarded-inline-job": "  "
+    + job
+    + ": {runs-on: ubuntu-latest, permissions: {packages: write}, steps: []}\n",
+    "unguarded-quoted-permissions": unguarded.replace(
+        "    permissions:", "    'permissions':"
+    ),
+    "unguarded-merged-permissions": unguarded.replace(
+        permissions, "    <<: *write-permissions\n"
+    ),
+    "unguarded-explicit-permissions-key": unguarded.replace(
+        permissions, "    ? permissions\n    : write-all\n"
+    ),
+    "unguarded-multiline-permission-value": unguarded.replace(
+        permissions, "    permissions:\n      packages: >-\n        write\n"
+    ),
+    "unguarded-duplicate-permissions": unguarded.replace(
+        permissions, permissions + "    permissions:\n      packages: write\n"
+    ),
+}
+for name, mutated in mutations.items():
+    candidate = source.replace(block, mutated, 1)
+    try:
+        check_source(filename, candidate)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError(f"Unsafe permission mutation was accepted: {name}")
 print(
     json.dumps(
         {
             "guarded_write_jobs": checked,
             "event_cases": len(fixtures),
             "branch_guard_negative_controls": len(checked),
+            "unsafe_permission_mutations_rejected": list(mutations),
         }
     )
 )
