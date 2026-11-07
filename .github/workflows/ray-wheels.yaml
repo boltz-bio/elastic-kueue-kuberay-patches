@@ -1,3 +1,5 @@
+# Build and test patched Ray wheels for pull requests, and attach release wheels only from trusted main-branch invocations.
+
 name: Ray Wheels
 
 # Builds the patched Ray wheel (stock PyPI wheel with the patched raylet, gcs_server and Python files) on the free
@@ -126,7 +128,7 @@ jobs:
   # download the wheel from the release.
   release:
     name: Attach Wheels And Publish The Release
-    if: ${{ inputs.release-tag != '' }}
+    if: ${{ github.repository == 'boltz-bio/elastic-kueue-kuberay-patches' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (inputs.release-tag != '') }}
     needs: [build, image]
     runs-on: ubuntu-24.04
     permissions:
