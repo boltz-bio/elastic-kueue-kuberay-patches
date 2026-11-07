@@ -1,7 +1,7 @@
 # Elastic Kueue & KubeRay Patches
 
-[![CI](https://github.com/simonepri/elastic-kueue-kuberay-patches/actions/workflows/ci.yaml/badge.svg)](https://github.com/simonepri/elastic-kueue-kuberay-patches/actions/workflows/ci.yaml)
-[![Release Please](https://github.com/simonepri/elastic-kueue-kuberay-patches/actions/workflows/release-please.yaml/badge.svg)](https://github.com/simonepri/elastic-kueue-kuberay-patches/actions/workflows/release-please.yaml)
+[![CI](https://github.com/boltz-bio/elastic-kueue-kuberay-patches/actions/workflows/ci.yaml/badge.svg)](https://github.com/boltz-bio/elastic-kueue-kuberay-patches/actions/workflows/ci.yaml)
+[![Release Please](https://github.com/boltz-bio/elastic-kueue-kuberay-patches/actions/workflows/release-please.yaml/badge.svg)](https://github.com/boltz-bio/elastic-kueue-kuberay-patches/actions/workflows/release-please.yaml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Tested on Kueue](https://img.shields.io/badge/tested%20on%20kueue-v0.20.2-blue)](https://github.com/kubernetes-sigs/kueue/releases/tag/v0.20.2)
 [![Tested on KubeRay](https://img.shields.io/badge/tested%20on%20kuberay-v1.7.1-blue)](https://github.com/ray-project/kuberay/releases/tag/v1.7.1)
@@ -161,6 +161,8 @@ Scenarios 05, 09, and 12, and the scenarios under [`tests/scenarios/kueue/01-par
 ---
 
 ## Dual Versioning Scheme
+
+Publication follows `GITHUB_REPOSITORY` for Ray wheel releases and `GITHUB_REPOSITORY_OWNER` for GHCR images. Local commands default to `boltz-bio/elastic-kueue-kuberay-patches` and `ghcr.io/boltz-bio`. Forking copies source history, not release assets or container images: verify each destination artifact and its digest before changing consumers. The `simonepri` examples below identify historical upstream artifacts; they do not assert that those tags already exist in the organization namespace.
 
 Images published by this repository use a compound tag format:
 
@@ -448,7 +450,7 @@ This repository uses [`mise`](https://mise.jdx.dev) to manage dependencies (`go`
 
 ```bash
 # Clone the repository
-git clone https://github.com/simonepri/elastic-kueue-kuberay-patches.git
+git clone https://github.com/boltz-bio/elastic-kueue-kuberay-patches.git
 cd elastic-kueue-kuberay-patches
 
 # Install all development tools
