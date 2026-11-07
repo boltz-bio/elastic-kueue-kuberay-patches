@@ -2,6 +2,7 @@
 # No kubelet runs on the simulated nodes. After the real scheduler's binding
 # assertions, simulate completion and release quota before Chainsaw deletes queues.
 set -euo pipefail
+. ./bounded-waits.sh
 job=$1
 pods=$(kubectl -n "$NS" get pods -l "job-name=$job" -o json | jq -r '.items[].metadata.name')
 for pod in $pods; do

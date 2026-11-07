@@ -34,6 +34,9 @@ jobs:
       - name: Check Generated RBAC Installation
         run: python3 tests/release/check-kueue-setup-rbac.py
 
+      - name: Check Delayed Topology Wait Bounds
+        run: python3 tests/release/check-delayed-topology-bounds.py
+
       - name: Validate Kueue Patches
         run: |
           git clone --depth 1 --branch ${{ steps.versions.outputs.kueue }} https://github.com/kubernetes-sigs/kueue.git /tmp/kueue
