@@ -1,0 +1,1207 @@
+diff --git a/pkg/controller/admissionchecks/karpenter/controller.go b/pkg/controller/admissionchecks/karpenter/controller.go
+index 2a1b15a..814d3d5 100644
+--- a/pkg/controller/admissionchecks/karpenter/controller.go
++++ b/pkg/controller/admissionchecks/karpenter/controller.go
+@@ -419,7 +419,11 @@ func (c *Controller) reconcileCheck(ctx context.Context, wl *kueue.Workload, che
+ 		}
+ 	}
+ 
+-	expected, problem, err := c.desiredNodeClaims(ctx, wl, attempt, cfg, guarded)
++	claims, err := c.listNodeClaims(ctx, wl.Namespace, wl.Name)
++	if err != nil {
++		return ctrl.Result{}, err
++	}
++	expected, problem, err := c.desiredNodeClaims(ctx, wl, attempt, cfg, guarded, claims)
+ 	if err != nil {
+ 		return ctrl.Result{}, err
+ 	}
+@@ -439,10 +443,6 @@ func (c *Controller) reconcileCheck(ctx context.Context, wl *kueue.Workload, che
+ 		return ctrl.Result{}, c.setCheck(ctx, wl, checkName, kueue.CheckStateReady, "No pods require NodeClaims")
+ 	}
+ 
+-	claims, err := c.listNodeClaims(ctx, wl.Namespace, wl.Name)
+-	if err != nil {
+-		return ctrl.Result{}, err
+-	}
+ 	current := make(map[string]*unstructured.Unstructured, len(claims))
+ 	for i := range claims {
+ 		claim := &claims[i]
+@@ -631,7 +631,7 @@ func (c *Controller) setCheck(ctx context.Context, wl *kueue.Workload, checkName
+ // desiredNodeClaims returns the NodeClaims for the admitted pods. A pod set's NodeClaims are restricted to the
+ // node labels of its flavors, use the NodePool those labels name, and each requests the resources of the pods
+ // packed onto it. A non-empty problem means the check cannot provision this reservation on its flavors.
+-func (c *Controller) desiredNodeClaims(ctx context.Context, wl *kueue.Workload, attempt string, cfg config, guarded []string) ([]*unstructured.Unstructured, string, error) {
++func (c *Controller) desiredNodeClaims(ctx context.Context, wl *kueue.Workload, attempt string, cfg config, guarded []string, existing []unstructured.Unstructured) ([]*unstructured.Unstructured, string, error) {
+ 	podSets := make(map[kueue.PodSetReference]kueue.PodSet, len(wl.Spec.PodSets))
+ 	for _, ps := range wl.Spec.PodSets {
+ 		podSets[ps.Name] = ps
+@@ -671,14 +671,30 @@ func (c *Controller) desiredNodeClaims(ctx context.Context, wl *kueue.Workload,
+ 		if err != nil || problem != "" {
+ 			return nil, problem, err
+ 		}
++		overhead, err := c.daemonSetOverhead(ctx, tmpl)
++		if err != nil {
++			return nil, "", err
++		}
+ 		perPod := resources.PodRequests(&ps.Template.Spec)
+-		perClaim := min(podsPerNodeClaim(perPod, tmpl.requirements, cfg.nodeFillFraction), count)
++		perClaim := min(podsPerNodeClaim(perPod, tmpl.requirements, cfg.nodeFillFraction, overhead), count)
+ 		for i := int32(0); i*perClaim < count; i++ {
+ 			pods := min(perClaim, count-i*perClaim)
+-			claim := tmpl.nodeClaim(wl, attempt, fmt.Sprintf("%s-%d", psa.Name, i), pods, perPod)
++			suffix := fmt.Sprintf("%s-%d", psa.Name, i)
++			claim := tmpl.nodeClaim(wl, attempt, suffix, pods, perPod, overhead)
+ 			labels := claim.GetLabels()
+ 			labels[constants.PodSetLabel] = string(psa.Name)
+ 			claim.SetLabels(labels)
++			// An upgrade must keep capacity already provisioned under the former name.
++			if wl.Annotations[ProvisionedAttemptAnnotation] == attempt {
++				legacyName := legacyNodeClaimName(wl.Name, attempt, suffix)
++				for j := range existing {
++					if existing[j].GetName() == legacyName && legacyName != claim.GetName() &&
++						matchesNodeClaimLabels(existing[j].GetLabels(), labels) {
++						claim.SetName(legacyName)
++						break
++					}
++				}
++			}
+ 			claims = append(claims, claim)
+ 		}
+ 	}
+@@ -755,15 +771,24 @@ func (c *Controller) nodeClaimTemplate(ctx context.Context, flavorLabels map[str
+ }
+ 
+ // nodeClaim returns a NodeClaim for the given number of pods of a pod set.
+-func (t *nodeClaimTemplate) nodeClaim(wl *kueue.Workload, attempt, suffix string, pods int32, perPod corev1.ResourceList) *unstructured.Unstructured {
+-	requests := map[string]any{}
++func (t *nodeClaimTemplate) nodeClaim(wl *kueue.Workload, attempt, suffix string, pods int32, perPod, overhead corev1.ResourceList) *unstructured.Unstructured {
++	totals := corev1.ResourceList{}
+ 	for name, q := range perPod {
+-		if q.IsZero() {
+-			continue
+-		}
+ 		total := q.DeepCopy()
+ 		total.Mul(int64(pods))
+-		requests[string(name)] = total.String()
++		totals[name] = total
++	}
++	totals[corev1.ResourcePods] = *resource.NewQuantity(int64(pods), resource.DecimalSI)
++	for name, q := range overhead {
++		total := totals[name]
++		total.Add(q)
++		totals[name] = total
++	}
++	requests := map[string]any{}
++	for name, q := range totals {
++		if !q.IsZero() {
++			requests[string(name)] = q.String()
++		}
+ 	}
+ 	spec := map[string]any{}
+ 	maps.Copy(spec, runtime.DeepCopyJSON(t.spec))
+@@ -779,16 +804,14 @@ func (t *nodeClaimTemplate) nodeClaim(wl *kueue.Workload, attempt, suffix string
+ 
+ 	nc := &unstructured.Unstructured{Object: map[string]any{"spec": spec}}
+ 	nc.SetGroupVersionKind(nodeClaimGVK)
+-	name := wl.Name
+-	if len(name) > 200 {
+-		name = name[:200]
+-	}
+-	nc.SetName(strings.ToLower(fmt.Sprintf("%s-%s-%s", name, attempt, suffix)))
++	identity := fmt.Sprintf("%s/%s/%s", wl.Namespace, wl.Name, wl.UID)
++	name := strings.ToLower(fmt.Sprintf("%s-%s-%s", wl.Name, attempt, suffix))
++	nc.SetName(boundedClaimIdentity(name, fmt.Sprintf("%s/%s/%s", identity, attempt, suffix)))
+ 	labels := map[string]string{}
+ 	maps.Copy(labels, t.labels)
+ 	maps.Copy(labels, map[string]string{
+ 		ManagedLabelKey:           "kueue",
+-		GangIDLabelKey:            "gang-" + wl.Name,
++		GangIDLabelKey:            boundedClaimIdentity("gang-"+wl.Name, identity),
+ 		WorkloadLabelKey:          wl.Name,
+ 		WorkloadNamespaceLabelKey: wl.Namespace,
+ 		AttemptLabelKey:           attempt,
+@@ -824,6 +847,32 @@ func (t *nodeClaimTemplate) nodeClaim(wl *kueue.Workload, attempt, suffix string
+ 	return nc
+ }
+ 
++// boundedClaimIdentity keeps identities within Kubernetes label values, including providers' name-valued labels.
++func boundedClaimIdentity(value, identity string) string {
++	if len(value) <= 63 {
++		return value
++	}
++	sum := sha256.Sum256([]byte(identity))
++	return fmt.Sprintf("%s-%x", strings.TrimRight(value[:30], "-."), sum[:16])
++}
++
++// legacyNodeClaimName identifies claims created before complete names were label-compatible.
++func legacyNodeClaimName(workloadName, attempt, suffix string) string {
++	if len(workloadName) > 200 {
++		workloadName = workloadName[:200]
++	}
++	return strings.ToLower(fmt.Sprintf("%s-%s-%s", workloadName, attempt, suffix))
++}
++
++func matchesNodeClaimLabels(actual, expected map[string]string) bool {
++	for key, value := range expected {
++		if actual[key] != value {
++			return false
++		}
++	}
++	return true
++}
++
+ func requirement(key, value string) map[string]any {
+ 	return map[string]any{"key": key, "operator": "In", "values": []any{value}}
+ }
+@@ -831,7 +880,7 @@ func requirement(key, value string) map[string]any {
+ // podsPerNodeClaim returns how many pods with the given requests one NodeClaim holds: as many as fit in the
+ // fill fraction of the largest instance the requirements allow. It is 1 when the requirements do not bound
+ // the instance size of a requested resource through the instance capacity labels.
+-func podsPerNodeClaim(perPod corev1.ResourceList, requirements []any, fillFraction float64) int32 {
++func podsPerNodeClaim(perPod corev1.ResourceList, requirements []any, fillFraction float64, overhead corev1.ResourceList) int32 {
+ 	pods := int64(math.MaxInt32)
+ 	for name, q := range perPod {
+ 		if q.IsZero() {
+@@ -846,7 +895,8 @@ func podsPerNodeClaim(perPod corev1.ResourceList, requirements []any, fillFracti
+ 			return 1
+ 		}
+ 		capacity := float64(units) * float64(capacityLabel.unit.MilliValue())
+-		pods = min(pods, int64(math.Floor(fillFraction*capacity/float64(q.MilliValue()))))
++		reserved := overhead[name]
++		pods = min(pods, int64(math.Floor((fillFraction*capacity-float64(reserved.MilliValue()))/float64(q.MilliValue()))))
+ 	}
+ 	if pods == math.MaxInt32 {
+ 		return 1
+diff --git a/pkg/controller/admissionchecks/karpenter/controller_test.go b/pkg/controller/admissionchecks/karpenter/controller_test.go
+index b351ac0..85a3c14 100644
+--- a/pkg/controller/admissionchecks/karpenter/controller_test.go
++++ b/pkg/controller/admissionchecks/karpenter/controller_test.go
+@@ -11,17 +11,22 @@ import (
+ 	"time"
+ 
+ 	"github.com/google/go-cmp/cmp"
++	appsv1 "k8s.io/api/apps/v1"
+ 	corev1 "k8s.io/api/core/v1"
+ 	apimeta "k8s.io/apimachinery/pkg/api/meta"
+ 	"k8s.io/apimachinery/pkg/api/resource"
++	apivalidation "k8s.io/apimachinery/pkg/api/validation"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+ 	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/apimachinery/pkg/util/validation"
++	"k8s.io/apimachinery/pkg/util/validation/field"
+ 	testingclock "k8s.io/utils/clock/testing"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+ 
+ 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
++	"sigs.k8s.io/kueue/pkg/constants"
+ 	controllerconstants "sigs.k8s.io/kueue/pkg/controller/constants"
+ 	"sigs.k8s.io/kueue/pkg/features"
+ 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
+@@ -235,7 +240,7 @@ func TestCreatesNodeClaimsForAdmittedPods(t *testing.T) {
+ 				map[string]any{"key": AntiTheftTaintKey, "value": wlName, "effect": "NoSchedule"},
+ 				map[string]any{"key": "nvidia.com/gpu", "effect": "NoSchedule"},
+ 			},
+-			"resources":   map[string]any{"requests": map[string]any{"cpu": "1"}},
++			"resources":   map[string]any{"requests": map[string]any{"cpu": "1", "pods": "1"}},
+ 			"expireAfter": "168h",
+ 		}
+ 		if diff := cmp.Diff(wantSpec, claim.Object["spec"]); diff != "" {
+@@ -440,7 +445,7 @@ func TestCooldownExpiresExclusions(t *testing.T) {
+ }
+ 
+ func TestDeletesNodeClaimsOfEarlierReservation(t *testing.T) {
+-	stale := (&nodeClaimTemplate{}).nodeClaim(utiltestingapi.MakeWorkload(wlName, ns).Obj(), "stale", "main-0", 1, nil)
++	stale := (&nodeClaimTemplate{}).nodeClaim(utiltestingapi.MakeWorkload(wlName, ns).Obj(), "stale", "main-0", 1, nil, nil)
+ 	f := newFixture(t, reservedWorkload("karpenter-a").Obj(), nil, stale)
+ 	f.reconcile()
+ 	for _, claim := range f.claims() {
+@@ -586,7 +591,7 @@ func TestSweepDeletesOrphanedNodeClaims(t *testing.T) {
+ 	attempt := attemptID(live, reservedAt)
+ 	old := metav1.NewTime(reservedAt.Add(-time.Hour))
+ 	claim := func(name, namespace, wlName, attempt string, created metav1.Time) *unstructured.Unstructured {
+-		nc := (&nodeClaimTemplate{}).nodeClaim(utiltestingapi.MakeWorkload(wlName, namespace).Obj(), attempt, "main-0", 1, nil)
++		nc := (&nodeClaimTemplate{}).nodeClaim(utiltestingapi.MakeWorkload(wlName, namespace).Obj(), attempt, "main-0", 1, nil, nil)
+ 		nc.SetName(name)
+ 		nc.SetCreationTimestamp(created)
+ 		if namespace == "" {
+@@ -700,7 +705,7 @@ func TestNodeClaimRequestsEffectivePodRequests(t *testing.T) {
+ 		t.Fatalf("got %d NodeClaims, want 1", len(claims))
+ 	}
+ 	// The init container runs beside the sidecar (3+1 CPUs), and so does the main container (1+1 CPUs, 2+1Gi).
+-	want := map[string]string{"cpu": "4", "memory": "3Gi", "ephemeral-storage": "10Gi", "nvidia.com/gpu": "1"}
++	want := map[string]string{"cpu": "4", "memory": "3Gi", "ephemeral-storage": "10Gi", "nvidia.com/gpu": "1", "pods": "1"}
+ 	if diff := cmp.Diff(want, requests(t, claims[0])); diff != "" {
+ 		t.Errorf("requests (-want +got):\n%s", diff)
+ 	}
+@@ -725,8 +730,8 @@ func TestPacksPodsWhenNodePoolBoundsInstanceSize(t *testing.T) {
+ 		pods     string
+ 		requests map[string]string
+ 	}{
+-		{"4", map[string]string{"cpu": "8", "memory": "16Gi"}},
+-		{"1", map[string]string{"cpu": "2", "memory": "4Gi"}},
++		{"4", map[string]string{"cpu": "8", "memory": "16Gi", "pods": "4"}},
++		{"1", map[string]string{"cpu": "2", "memory": "4Gi", "pods": "1"}},
+ 	} {
+ 		if got := claims[i].GetAnnotations()[PodsAnnotation]; got != want.pods {
+ 			t.Errorf("NodeClaim %s sized for %s pods, want %s", claims[i].GetName(), got, want.pods)
+@@ -780,7 +785,7 @@ func TestPodsPerNodeClaim(t *testing.T) {
+ 	}
+ 	for name, tc := range cases {
+ 		t.Run(name, func(t *testing.T) {
+-			if got := podsPerNodeClaim(tc.requests, tc.requirements, tc.fraction); got != tc.want {
++			if got := podsPerNodeClaim(tc.requests, tc.requirements, tc.fraction, nil); got != tc.want {
+ 				t.Errorf("podsPerNodeClaim = %d, want %d", got, tc.want)
+ 			}
+ 		})
+@@ -947,3 +952,237 @@ func TestReleasesDisruptionHoldOncePodsAreBound(t *testing.T) {
+ 		t.Errorf("holds released annotation = %q, want the attempt", got)
+ 	}
+ }
++
++func TestNodeClaimNamesFitProviderLabels(t *testing.T) {
++	for name, tc := range map[string]struct {
++		workload  string
++		suffix    string
++		unchanged bool
++	}{
++		"exactly 63 bytes":          {workload: strings.Repeat("a", 45), suffix: "main-0", unchanged: true},
++		"exactly 64 bytes":          {workload: strings.Repeat("a", 46), suffix: "main-0"},
++		"long workload and pod set": {workload: strings.Repeat("a", 58), suffix: strings.Repeat("b", 63) + "-99"},
++	} {
++		t.Run(name, func(t *testing.T) {
++			wl := utiltestingapi.MakeWorkload(tc.workload, "example").UID("workload-uid").Obj()
++			claim := (&nodeClaimTemplate{}).nodeClaim(wl, "0123456789", tc.suffix, 1, nil, nil)
++			got := claim.GetName()
++			if errors := validation.IsValidLabelValue(got); len(errors) != 0 {
++				t.Fatalf("name cannot be used as a label: %v", errors)
++			}
++			legacy := legacyNodeClaimName(wl.Name, "0123456789", tc.suffix)
++			if (got == legacy) != tc.unchanged {
++				t.Errorf("name=%q legacy=%q unchanged=%t", got, legacy, tc.unchanged)
++			}
++			if !tc.unchanged {
++				meta := metav1.ObjectMeta{Name: legacy}
++				if errors := apivalidation.ValidateObjectMeta(&meta, false, apivalidation.NameIsDNSSubdomain, field.NewPath("metadata")); len(errors) != 0 {
++					t.Fatalf("legacy name itself should be valid: %v", errors)
++				}
++				meta.Labels = map[string]string{"provider.example.com/claim-name": legacy}
++				if errors := apivalidation.ValidateObjectMeta(&meta, false, apivalidation.NameIsDNSSubdomain, field.NewPath("metadata")); len(errors) == 0 {
++					t.Fatal("legacy provider label unexpectedly passed API validation")
++				}
++			}
++			labels := claim.GetLabels()
++			labels["provider.example.com/claim-name"] = got
++			meta := metav1.ObjectMeta{Name: got, Labels: labels}
++			if errors := apivalidation.ValidateObjectMeta(&meta, false, apivalidation.NameIsDNSSubdomain, field.NewPath("metadata")); len(errors) != 0 {
++				t.Fatalf("provider metadata violates API validation: %v", errors)
++			}
++		})
++	}
++}
++
++func TestNodeClaimNamesHashTheFullIdentity(t *testing.T) {
++	base := utiltestingapi.MakeWorkload(strings.Repeat("a", 201)+"x", "example").UID("workload-uid").Obj()
++	claimName := func(wl *kueue.Workload, attempt, suffix string) string {
++		return (&nodeClaimTemplate{}).nodeClaim(wl, attempt, suffix, 1, nil, nil).GetName()
++	}
++	want := claimName(base, "0123456789", "workers-0")
++	if got := claimName(base.DeepCopy(), "0123456789", "workers-0"); got != want {
++		t.Fatalf("same identity produced %q then %q", want, got)
++	}
++	seen := map[string]string{want: "base"}
++	for name, mutate := range map[string]func(*kueue.Workload) (string, string){
++		"untruncated workload tail": func(wl *kueue.Workload) (string, string) {
++			wl.Name = strings.Repeat("a", 201) + "y"
++			return "0123456789", "workers-0"
++		},
++		"namespace":    func(wl *kueue.Workload) (string, string) { wl.Namespace = "another"; return "0123456789", "workers-0" },
++		"workload UID": func(wl *kueue.Workload) (string, string) { wl.UID = "another-uid"; return "0123456789", "workers-0" },
++		"attempt":      func(wl *kueue.Workload) (string, string) { return "9876543210", "workers-0" },
++		"pod set":      func(wl *kueue.Workload) (string, string) { return "0123456789", "another-0" },
++		"ordinal":      func(wl *kueue.Workload) (string, string) { return "0123456789", "workers-1" },
++	} {
++		wl := base.DeepCopy()
++		attempt, suffix := mutate(wl)
++		got := claimName(wl, attempt, suffix)
++		if previous, exists := seen[got]; exists {
++			t.Errorf("%s and %s produced the same name %q", name, previous, got)
++		}
++		seen[got] = name
++		if errors := validation.IsValidLabelValue(got); len(errors) != 0 {
++			t.Errorf("%s: %v", name, errors)
++		}
++	}
++}
++
++func TestAdoptsAlreadyProvisionedLegacyNodeClaim(t *testing.T) {
++	for name, mutate := range map[string]func(*unstructured.Unstructured, *kueue.Workload){
++		"matching registered claim": func(*unstructured.Unstructured, *kueue.Workload) {},
++		"unrelated claim name":      func(nc *unstructured.Unstructured, _ *kueue.Workload) { nc.SetName(nc.GetName() + "-other") },
++		"unrelated attempt": func(nc *unstructured.Unstructured, _ *kueue.Workload) {
++			labels := nc.GetLabels()
++			labels[AttemptLabelKey] = "another"
++			nc.SetLabels(labels)
++		},
++		"unrelated workload": func(nc *unstructured.Unstructured, _ *kueue.Workload) {
++			labels := nc.GetLabels()
++			labels[WorkloadLabelKey] = "another"
++			nc.SetLabels(labels)
++		},
++		"unrelated namespace": func(nc *unstructured.Unstructured, _ *kueue.Workload) {
++			labels := nc.GetLabels()
++			labels[WorkloadNamespaceLabelKey] = "another"
++			nc.SetLabels(labels)
++		},
++		"unrelated pod set": func(nc *unstructured.Unstructured, _ *kueue.Workload) {
++			labels := nc.GetLabels()
++			labels[constants.PodSetLabel] = "another"
++			nc.SetLabels(labels)
++		},
++		"unrelated pool": func(nc *unstructured.Unstructured, _ *kueue.Workload) {
++			labels := nc.GetLabels()
++			labels[NodePoolLabelKey] = "another"
++			nc.SetLabels(labels)
++		},
++		"not already provisioned": func(_ *unstructured.Unstructured, wl *kueue.Workload) {
++			delete(wl.Annotations, ProvisionedAttemptAnnotation)
++		},
++	} {
++		t.Run(name, func(t *testing.T) {
++			wl := reservedWorkload("karpenter-a").Obj()
++			wl.Name = strings.Repeat("a", 46)
++			attempt := attemptID(wl, reservedAt)
++			wl.Annotations = map[string]string{ProvisionedAttemptAnnotation: attempt}
++			f := newFixture(t, wl, nil)
++			f.wlKey.Name = wl.Name
++			cfg, err := parseConfig(&kueue.AdmissionCheck{})
++			if err != nil {
++				t.Fatal(err)
++			}
++			expected, problem, err := f.ctrl.desiredNodeClaims(f.ctx, wl, attempt, cfg, []string{"karpenter-a"}, nil)
++			if err != nil || problem != "" || len(expected) != 2 {
++				t.Fatalf("desired claims: %d %q %v", len(expected), problem, err)
++			}
++			legacyNames := map[string]bool{}
++			for i, claim := range expected {
++				claim.SetName(legacyNodeClaimName(wl.Name, attempt, fmt.Sprintf("%s-%d", kueue.DefaultPodSetName, i)))
++				legacyNames[claim.GetName()] = true
++				mutate(claim, wl)
++				if err := f.c.Create(f.ctx, claim); err != nil {
++					t.Fatal(err)
++				}
++				f.setCondition(claim, conditionRegistered)
++				f.setCondition(claim, conditionLaunched)
++			}
++			if err := f.c.Update(f.ctx, wl); err != nil {
++				t.Fatal(err)
++			}
++			f.reconcile()
++			matching := name == "matching registered claim"
++			if got := f.check().State; (got == kueue.CheckStateReady) != matching {
++				t.Fatalf("check=%s, matching=%t", got, matching)
++			}
++			if matching {
++				claims := f.claims()
++				if len(claims) != 2 {
++					t.Fatalf("got %d claims after adoption", len(claims))
++				}
++				for _, claim := range claims {
++					if !legacyNames[claim.GetName()] {
++						t.Errorf("created replacement %s", claim.GetName())
++					}
++				}
++			}
++		})
++	}
++}
++
++func TestNodeClaimMetadataAllowsMaximumLengthWorkloadAndPodSet(t *testing.T) {
++	for _, size := range []int{58, 59, 63} {
++		t.Run(fmt.Sprintf("workload length %d", size), func(t *testing.T) {
++			wl := utiltestingapi.MakeWorkload(strings.Repeat("a", size), "example").UID("workload-uid").Obj()
++			podSet := strings.Repeat("b", 63)
++			claim := (&nodeClaimTemplate{}).nodeClaim(wl, "0123456789", podSet+"-0", 1, nil, nil)
++			labels := claim.GetLabels()
++			labels[constants.PodSetLabel] = podSet
++			labels["provider.example.com/claim-name"] = claim.GetName()
++			meta := metav1.ObjectMeta{Name: claim.GetName(), Labels: labels}
++			if errors := apivalidation.ValidateObjectMeta(&meta, false, apivalidation.NameIsDNSSubdomain, field.NewPath("metadata")); len(errors) != 0 {
++				t.Fatalf("generated metadata violates API validation: %v", errors)
++			}
++			if size == 58 && labels[GangIDLabelKey] != "gang-"+wl.Name {
++				t.Error("changed valid existing gang ID")
++			}
++		})
++	}
++}
++
++func controllerOverheadDaemonSet(cpu, memory string) *appsv1.DaemonSet {
++	return &appsv1.DaemonSet{
++		ObjectMeta: metav1.ObjectMeta{Name: "node-agent", Namespace: "system", UID: "daemon-uid"},
++		Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
++			Containers: []corev1.Container{{Name: "agent", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
++				corev1.ResourceCPU: resource.MustParse(cpu), corev1.ResourceMemory: resource.MustParse(memory),
++			}}}},
++			Tolerations: []corev1.Toleration{{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists}},
++		}}},
++	}
++}
++
++func TestNodeClaimIncludesWorkerAndDaemonSetResources(t *testing.T) {
++	ps := utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 1).
++		Request(corev1.ResourceCPU, "3").Request(corev1.ResourceMemory, "12Gi").Request("nvidia.com/gpu", "1").Obj()
++	f := newFixture(t, podSetWorkload(ps), nil, controllerOverheadDaemonSet("500m", "5Gi"))
++	f.reconcile()
++	claims := f.claims()
++	if len(claims) != 1 {
++		t.Fatalf("got %d claims, want 1", len(claims))
++	}
++	want := map[string]string{"cpu": "3500m", "memory": "17Gi", "nvidia.com/gpu": "1", "pods": "2"}
++	if diff := cmp.Diff(want, requests(t, claims[0])); diff != "" {
++		t.Fatalf("claim requests (-want +got):\n%s", diff)
++	}
++	actual := resource.MustParse(requests(t, claims[0])["memory"])
++	if actual.Cmp(resource.MustParse("14Gi")) <= 0 {
++		t.Error("claim still fits the undersized candidate")
++	}
++	if got := ps.Template.Spec.Containers[0].Resources.Requests.Memory().String(); got != "12Gi" {
++		t.Errorf("worker memory changed to %s", got)
++	}
++}
++
++func TestPacksWorkersAfterReservingDaemonSetResources(t *testing.T) {
++	ps := utiltestingapi.MakePodSet(kueue.DefaultPodSetName, 5).
++		Request(corev1.ResourceCPU, "2").Request(corev1.ResourceMemory, "4Gi").Obj()
++	f := newFixture(t, podSetWorkload(ps), nil, controllerOverheadDaemonSet("2", "5Gi"))
++	f.setPoolField([]any{
++		map[string]any{"key": "karpenter.k8s.aws/instance-cpu", "operator": "In", "values": []any{"16"}},
++		map[string]any{"key": "karpenter.k8s.aws/instance-memory", "operator": "In", "values": []any{"65536"}},
++	}, "spec", "template", "spec", "requirements")
++	f.reconcile()
++	claims := f.claims()
++	if len(claims) != 2 {
++		t.Fatalf("got %d claims, want 2", len(claims))
++	}
++	for i, want := range []map[string]string{
++		{"cpu": "8", "memory": "17Gi", "pods": "4"},
++		{"cpu": "6", "memory": "13Gi", "pods": "3"},
++	} {
++		if diff := cmp.Diff(want, requests(t, claims[i])); diff != "" {
++			t.Errorf("claim %d requests (-want +got):\n%s", i, diff)
++		}
++	}
++}
+diff --git a/pkg/controller/admissionchecks/karpenter/overhead.go b/pkg/controller/admissionchecks/karpenter/overhead.go
+new file mode 100644
+index 0000000..021bc85
+--- /dev/null
++++ b/pkg/controller/admissionchecks/karpenter/overhead.go
+@@ -0,0 +1,303 @@
++// Size reserved NodeClaims for the DaemonSets that can share each node. Use admitted Pod requests while preserving the DaemonSet's placement constraints.
++package karpenter
++
++import (
++	"context"
++	"fmt"
++	"math"
++	"strconv"
++
++	appsv1 "k8s.io/api/apps/v1"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/resource"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/labels"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/selection"
++	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
++	"k8s.io/klog/v2"
++
++	"sigs.k8s.io/kueue/pkg/resources"
++)
++
++// +kubebuilder:rbac:groups="apps",resources=daemonsets,verbs=get;list
++
++// daemonSetOverhead returns one effective request, including a Pod slot, per compatible DaemonSet.
++func (c *Controller) daemonSetOverhead(ctx context.Context, tmpl *nodeClaimTemplate) (corev1.ResourceList, error) {
++	daemonSets := &appsv1.DaemonSetList{}
++	if err := c.APIReader.List(ctx, daemonSets); err != nil {
++		return nil, fmt.Errorf("listing DaemonSets for NodeClaim overhead: %w", err)
++	}
++	requests := corev1.ResourceList{}
++	if len(daemonSets.Items) == 0 {
++		return requests, nil
++	}
++	pods := &corev1.PodList{}
++	if err := c.APIReader.List(ctx, pods); err != nil {
++		return nil, fmt.Errorf("listing admitted DaemonSet Pods for NodeClaim overhead: %w", err)
++	}
++	for i := range daemonSets.Items {
++		ds := &daemonSets.Items[i]
++		if ds.DeletionTimestamp != nil {
++			continue
++		}
++		daemonRequests := corev1.ResourceList{}
++		compatible := false
++		for _, pod := range daemonSetPods(ds, pods.Items) {
++			fits, err := daemonSetCompatible(tmpl, pod)
++			if err != nil {
++				return nil, fmt.Errorf("checking DaemonSet %s/%s for NodeClaim overhead: %w", ds.Namespace, ds.Name, err)
++			}
++			if !fits {
++				continue
++			}
++			compatible = true
++			// Replicas can have different admission/VPA requests during a rollout. Reserve their per-resource maximum once.
++			for name, quantity := range resources.PodRequests(&pod.Spec) {
++				if current := daemonRequests[name]; quantity.Cmp(current) > 0 {
++					daemonRequests[name] = quantity.DeepCopy()
++				}
++			}
++		}
++		if !compatible {
++			continue
++		}
++		for name, quantity := range daemonRequests {
++			total := requests[name]
++			total.Add(quantity)
++			requests[name] = total
++		}
++		count := requests[corev1.ResourcePods]
++		count.Add(resource.MustParse("1"))
++		requests[corev1.ResourcePods] = count
++	}
++	return requests, nil
++}
++
++// daemonSetPods preserves admission mutations without inheriting the controller's node-specific affinity.
++func daemonSetPods(ds *appsv1.DaemonSet, pods []corev1.Pod) []*corev1.Pod {
++	// The current template can request more than old replicas while its rollout is starting.
++	representatives := []*corev1.Pod{daemonSetSchedulingPod(ds, &corev1.Pod{Spec: *ds.Spec.Template.Spec.DeepCopy()})}
++	for i := range pods {
++		pod := &pods[i]
++		if pod.Namespace == ds.Namespace && metav1.IsControlledBy(pod, ds) &&
++			pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed && pod.DeletionTimestamp == nil {
++			representatives = append(representatives, daemonSetSchedulingPod(ds, pod))
++		}
++	}
++	return representatives
++}
++
++func daemonSetSchedulingPod(ds *appsv1.DaemonSet, admitted *corev1.Pod) *corev1.Pod {
++	pod := admitted.DeepCopy()
++	// The DaemonSet controller replaces required affinity with the selected node's name.
++	if pod.Spec.Affinity != nil && pod.Spec.Affinity.NodeAffinity != nil {
++		pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = nil
++	}
++	if affinity := ds.Spec.Template.Spec.Affinity; affinity != nil && affinity.NodeAffinity != nil &&
++		affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
++		if pod.Spec.Affinity == nil {
++			pod.Spec.Affinity = &corev1.Affinity{}
++		}
++		if pod.Spec.Affinity.NodeAffinity == nil {
++			pod.Spec.Affinity.NodeAffinity = &corev1.NodeAffinity{}
++		}
++		pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution =
++			affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.DeepCopy()
++	}
++	// Kubernetes adds these tolerations when creating DaemonSet Pods, including when no replica exists yet.
++	for _, key := range []string{corev1.TaintNodeNotReady, corev1.TaintNodeUnreachable} {
++		pod.Spec.Tolerations = append(pod.Spec.Tolerations, corev1.Toleration{Key: key, Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute})
++	}
++	for _, key := range []string{corev1.TaintNodeDiskPressure, corev1.TaintNodeMemoryPressure, corev1.TaintNodePIDPressure, corev1.TaintNodeUnschedulable} {
++		pod.Spec.Tolerations = append(pod.Spec.Tolerations, corev1.Toleration{Key: key, Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule})
++	}
++	if pod.Spec.HostNetwork {
++		pod.Spec.Tolerations = append(pod.Spec.Tolerations, corev1.Toleration{Key: corev1.TaintNodeNetworkUnavailable, Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule})
++	}
++	return pod
++}
++
++func daemonSetCompatible(tmpl *nodeClaimTemplate, pod *corev1.Pod) (bool, error) {
++	if raw, ok := tmpl.spec["taints"]; ok {
++		taints := struct {
++			Taints []corev1.Taint `json:"taints"`
++		}{}
++		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(map[string]any{"taints": raw}, &taints); err != nil {
++			return false, fmt.Errorf("decoding NodePool taints: %w", err)
++		}
++		for _, taint := range taints.Taints {
++			if taint.Key == AntiTheftTaintKey || (taint.Effect != corev1.TaintEffectNoSchedule && taint.Effect != corev1.TaintEffectNoExecute) {
++				continue
++			}
++			tolerated := false
++			for _, toleration := range pod.Spec.Tolerations {
++				tolerated = tolerated || toleration.ToleratesTaint(klog.Background(), &taint, true)
++			}
++			if !tolerated {
++				return false, nil
++			}
++		}
++	}
++	base := []corev1.NodeSelectorRequirement{}
++	for _, raw := range tmpl.requirements {
++		object, ok := raw.(map[string]any)
++		if !ok {
++			return false, fmt.Errorf("invalid NodeClaim requirement %T", raw)
++		}
++		req := corev1.NodeSelectorRequirement{}
++		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(object, &req); err != nil {
++			return false, fmt.Errorf("decoding NodeClaim requirement: %w", err)
++		}
++		base = append(base, req)
++	}
++	for key, value := range tmpl.labels {
++		base = append(base, corev1.NodeSelectorRequirement{Key: key, Operator: corev1.NodeSelectorOpIn, Values: []string{value}})
++	}
++	for key, value := range pod.Spec.NodeSelector {
++		base = append(base, corev1.NodeSelectorRequirement{Key: key, Operator: corev1.NodeSelectorOpIn, Values: []string{value}})
++	}
++	if affinity := pod.Spec.Affinity; affinity != nil && affinity.NodeAffinity != nil &&
++		affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
++		for _, term := range affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
++			if len(term.MatchExpressions) == 0 && len(term.MatchFields) == 0 {
++				continue
++			}
++			compatible, err := selectorRequirementsCompatible(append(append([]corev1.NodeSelectorRequirement{}, base...), term.MatchExpressions...))
++			if err != nil {
++				return false, err
++			}
++			fieldsCompatible, err := daemonSetFieldsCompatible(term.MatchFields)
++			if err != nil {
++				return false, err
++			}
++			if compatible && fieldsCompatible {
++				return true, nil
++			}
++		}
++		return false, nil
++	}
++	return selectorRequirementsCompatible(base)
++}
++
++func daemonSetFieldsCompatible(requirements []corev1.NodeSelectorRequirement) (bool, error) {
++	if len(requirements) == 0 {
++		return true, nil
++	}
++	selector, err := nodeaffinity.NewNodeSelector(&corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchFields: requirements}}})
++	if err != nil {
++		return false, err
++	}
++	var names []string
++	for _, req := range requirements {
++		if req.Key == "metadata.name" && req.Operator == corev1.NodeSelectorOpIn {
++			names = req.Values
++			break
++		}
++	}
++	if names == nil {
++		// Without an exact name, one more candidate than exclusions guarantees a possible future node name.
++		for i := 0; i <= len(requirements); i++ {
++			names = append(names, "daemon-node-"+strconv.Itoa(i))
++		}
++	}
++	for _, name := range names {
++		if selector.Match(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}}) {
++			return true, nil
++		}
++	}
++	return false, nil
++}
++
++// selectorRequirementsCompatible checks intersections without mistaking unknown future labels for absent labels.
++func selectorRequirementsCompatible(requirements []corev1.NodeSelectorRequirement) (bool, error) {
++	groups := map[string][]*labels.Requirement{}
++	for _, req := range requirements {
++		operators := map[corev1.NodeSelectorOperator]selection.Operator{
++			corev1.NodeSelectorOpIn: selection.In, corev1.NodeSelectorOpNotIn: selection.NotIn,
++			corev1.NodeSelectorOpExists: selection.Exists, corev1.NodeSelectorOpDoesNotExist: selection.DoesNotExist,
++			corev1.NodeSelectorOpGt: selection.GreaterThan, corev1.NodeSelectorOpLt: selection.LessThan,
++		}
++		op, ok := operators[req.Operator]
++		if !ok {
++			return false, fmt.Errorf("unsupported selector operator %q", req.Operator)
++		}
++		parsed, err := labels.NewRequirement(req.Key, op, req.Values)
++		if err != nil {
++			return false, err
++		}
++		groups[req.Key] = append(groups[req.Key], parsed)
++	}
++	for key, group := range groups {
++		matches := func(values labels.Set) bool {
++			for _, req := range group {
++				if !req.Matches(values) {
++					return false
++				}
++			}
++			return true
++		}
++		if matches(labels.Set{}) {
++			continue
++		}
++		var candidates []string
++		bounded := false
++		lower, upper := int64(0), int64(math.MaxInt64)
++		valuesCount := 0
++		for _, req := range group {
++			values := req.Values().List()
++			valuesCount += len(values)
++			if req.Operator() == selection.In {
++				candidates, bounded = values, true
++				break
++			}
++		}
++		if !bounded {
++			numeric := false
++			for _, req := range group {
++				if req.Operator() != selection.GreaterThan && req.Operator() != selection.LessThan {
++					continue
++				}
++				numeric = true
++				n, _ := strconv.ParseInt(req.Values().List()[0], 10, 64)
++				if req.Operator() == selection.GreaterThan {
++					if n == math.MaxInt64 {
++						return false, nil
++					}
++					lower = max(lower, n+1)
++				} else {
++					upper = min(upper, n-1)
++				}
++			}
++			if numeric {
++				for n, tried := lower, 0; n <= upper && tried <= valuesCount; tried++ {
++					value := strconv.FormatInt(n, 10)
++					// Leading zeros are valid label values, including when a narrow numeric range excludes the canonical spelling.
++					for len(value) <= 63 {
++						candidates = append(candidates, value)
++						value = "0" + value
++					}
++					if n == math.MaxInt64 {
++						break
++					}
++					n++
++				}
++			} else {
++				for i := 0; i <= valuesCount; i++ {
++					candidates = append(candidates, "daemon-"+strconv.Itoa(i))
++				}
++			}
++		}
++		found := false
++		for _, value := range candidates {
++			if matches(labels.Set{key: value}) {
++				found = true
++				break
++			}
++		}
++		if !found {
++			return false, nil
++		}
++	}
++	return true, nil
++}
+diff --git a/pkg/controller/admissionchecks/karpenter/overhead_test.go b/pkg/controller/admissionchecks/karpenter/overhead_test.go
+new file mode 100644
+index 0000000..22841af
+--- /dev/null
++++ b/pkg/controller/admissionchecks/karpenter/overhead_test.go
+@@ -0,0 +1,268 @@
++// Verify per-node DaemonSet budgets from public API objects, including admission mutations, placement constraints, and request aggregation.
++package karpenter
++
++import (
++	"context"
++	"errors"
++	"reflect"
++	"strings"
++	"testing"
++
++	appsv1 "k8s.io/api/apps/v1"
++	corev1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/resource"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
++)
++
++func overheadDaemonSet(name string) *appsv1.DaemonSet {
++	return &appsv1.DaemonSet{
++		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "system", UID: types.UID(name)},
++		Spec: appsv1.DaemonSetSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
++			Containers: []corev1.Container{{Name: "agent", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
++				corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("1Gi"),
++			}}}},
++		}}},
++	}
++}
++
++func overheadPod(ds *appsv1.DaemonSet, name, cpu, memory string) *corev1.Pod {
++	return &corev1.Pod{
++		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ds.Namespace, UID: types.UID(name), OwnerReferences: []metav1.OwnerReference{{
++			APIVersion: "apps/v1", Kind: "DaemonSet", Name: ds.Name, UID: ds.UID, Controller: new(true),
++		}}},
++		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "agent", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
++			corev1.ResourceCPU: resource.MustParse(cpu), corev1.ResourceMemory: resource.MustParse(memory),
++		}}}}},
++	}
++}
++
++func assertOverhead(t *testing.T, got corev1.ResourceList, want map[corev1.ResourceName]string) {
++	t.Helper()
++	if len(got) != len(want) {
++		t.Fatalf("resources = %v, want %v", got, want)
++	}
++	for name, text := range want {
++		quantity := got[name]
++		if quantity.Cmp(resource.MustParse(text)) != 0 {
++			t.Errorf("%s = %s, want %s", name, quantity.String(), text)
++		}
++	}
++}
++
++func TestDaemonSetOverheadAdmittedReplicas(t *testing.T) {
++	ds := overheadDaemonSet("agent")
++	ds.Spec.Template.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
++		RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
++			MatchExpressions: []corev1.NodeSelectorRequirement{{Key: corev1.LabelArchStable, Operator: corev1.NodeSelectorOpIn, Values: []string{"amd64"}}},
++		}}},
++	}}
++	pod := overheadPod(ds, "replica-a", "400m", "2Gi")
++	pod.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
++		RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
++			MatchFields: []corev1.NodeSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"existing-node"}}},
++		}}},
++	}}
++	other := overheadPod(ds, "replica-b", "200m", "3Gi")
++	wrongOwner := overheadPod(ds, "old-daemonset-uid", "8", "64Gi")
++	wrongOwner.OwnerReferences[0].UID = "replaced-daemonset"
++	terminal := overheadPod(ds, "terminal", "8", "64Gi")
++	terminal.Status.Phase = corev1.PodSucceeded
++	client := utiltesting.NewClientBuilder().WithObjects(ds, pod, other, wrongOwner, terminal).Build()
++	c := &Controller{APIReader: client}
++	tmpl := &nodeClaimTemplate{requirements: []any{requirement(corev1.LabelArchStable, "amd64")}}
++	got, err := c.daemonSetOverhead(t.Context(), tmpl)
++	if err != nil {
++		t.Fatal(err)
++	}
++	assertOverhead(t, got, map[corev1.ResourceName]string{corev1.ResourceCPU: "400m", corev1.ResourceMemory: "3Gi", corev1.ResourcePods: "1"})
++	// The admitted resource changes survive; affinity comes from the template and both inputs stay intact.
++	beforeDS, beforePod := ds.DeepCopy(), pod.DeepCopy()
++	representatives := daemonSetPods(ds, []corev1.Pod{*pod})
++	if len(representatives) != 2 || !reflect.DeepEqual(representatives[1].Spec.Affinity, ds.Spec.Template.Spec.Affinity) {
++		t.Fatalf("required affinity = %v, want DaemonSet template affinity", representatives)
++	}
++	if !reflect.DeepEqual(ds, beforeDS) || !reflect.DeepEqual(pod, beforePod) {
++		t.Fatal("DaemonSet or admitted Pod mutated")
++	}
++	// Template affinity must also exclude this same live Pod from an ARM node.
++	got, err = c.daemonSetOverhead(t.Context(), &nodeClaimTemplate{requirements: []any{requirement(corev1.LabelArchStable, "arm64")}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	assertOverhead(t, got, map[corev1.ResourceName]string{})
++	// A new template request must be reserved before the first updated replica exists.
++	ds.Spec.Template.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory] = resource.MustParse("5Gi")
++	c = &Controller{APIReader: utiltesting.NewClientBuilder().WithObjects(ds, pod, other).Build()}
++	got, err = c.daemonSetOverhead(t.Context(), tmpl)
++	if err != nil {
++		t.Fatal(err)
++	}
++	assertOverhead(t, got, map[corev1.ResourceName]string{corev1.ResourceCPU: "400m", corev1.ResourceMemory: "5Gi", corev1.ResourcePods: "1"})
++}
++
++func TestDaemonSetOverheadResourceSemantics(t *testing.T) {
++	ds := overheadDaemonSet("agent")
++	ds.Spec.Template.Spec.InitContainers = []corev1.Container{
++		{Name: "sidecar", RestartPolicy: new(corev1.ContainerRestartPolicyAlways), Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
++			corev1.ResourceCPU: resource.MustParse("50m"), corev1.ResourceMemory: resource.MustParse("128Mi"),
++		}}},
++		{Name: "init", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
++			corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("4Gi"),
++		}}},
++	}
++	ds.Spec.Template.Spec.Overhead = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("25m"), corev1.ResourceMemory: resource.MustParse("64Mi")}
++	other := overheadDaemonSet("other")
++	c := &Controller{APIReader: utiltesting.NewClientBuilder().WithObjects(ds, other).Build()}
++	got, err := c.daemonSetOverhead(t.Context(), &nodeClaimTemplate{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	assertOverhead(t, got, map[corev1.ResourceName]string{corev1.ResourceCPU: "675m", corev1.ResourceMemory: "5312Mi", corev1.ResourcePods: "2"})
++}
++
++func TestDaemonSetOverheadDeletingDaemonSet(t *testing.T) {
++	ds := overheadDaemonSet("agent")
++	now := metav1.Now()
++	ds.DeletionTimestamp = &now
++	ds.Finalizers = []string{"cleanup"}
++	c := &Controller{APIReader: utiltesting.NewClientBuilder().WithObjects(ds).Build()}
++	got, err := c.daemonSetOverhead(t.Context(), &nodeClaimTemplate{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	assertOverhead(t, got, map[corev1.ResourceName]string{})
++}
++
++func TestDaemonSetOverheadPlacement(t *testing.T) {
++	for name, tc := range map[string]struct {
++		selector     map[string]string
++		affinity     []corev1.NodeSelectorTerm
++		requirements []any
++		labels       map[string]string
++		taints       []any
++		tolerations  []corev1.Toleration
++		want         bool
++	}{
++		"matching architecture":     {selector: map[string]string{corev1.LabelArchStable: "amd64"}, requirements: []any{requirement(corev1.LabelArchStable, "amd64")}, want: true},
++		"incompatible architecture": {selector: map[string]string{corev1.LabelArchStable: "arm64"}, requirements: []any{requirement(corev1.LabelArchStable, "amd64")}},
++		"future GPU label":          {selector: map[string]string{"nvidia.com/gpu.present": "true"}, want: true},
++		"template label":            {selector: map[string]string{"team": "ml"}, labels: map[string]string{"team": "other"}},
++		"affinity OR": {requirements: []any{requirement(corev1.LabelArchStable, "amd64")}, affinity: []corev1.NodeSelectorTerm{
++			{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: corev1.LabelArchStable, Operator: corev1.NodeSelectorOpIn, Values: []string{"arm64"}}}},
++			{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: corev1.LabelArchStable, Operator: corev1.NodeSelectorOpNotIn, Values: []string{"arm64"}}}},
++		}, want: true},
++		"empty required affinity":       {affinity: []corev1.NodeSelectorTerm{}},
++		"empty affinity term":           {affinity: []corev1.NodeSelectorTerm{{}}},
++		"untolerated permanent taint":   {taints: []any{map[string]any{"key": "nvidia.com/gpu", "effect": "NoSchedule"}}},
++		"permanent taint tolerated":     {taints: []any{map[string]any{"key": "nvidia.com/gpu", "effect": "NoSchedule"}}, tolerations: []corev1.Toleration{{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists}}, want: true},
++		"reservation taint":             {taints: []any{map[string]any{"key": AntiTheftTaintKey, "effect": "NoSchedule"}}, want: true},
++		"preference taint":              {taints: []any{map[string]any{"key": "preference", "effect": "PreferNoSchedule"}}, want: true},
++		"automatic pressure toleration": {taints: []any{map[string]any{"key": corev1.TaintNodeMemoryPressure, "effect": "NoSchedule"}}, want: true},
++	} {
++		t.Run(name, func(t *testing.T) {
++			ds := overheadDaemonSet("agent")
++			ds.Spec.Template.Spec.NodeSelector = tc.selector
++			ds.Spec.Template.Spec.Tolerations = tc.tolerations
++			if tc.affinity != nil {
++				ds.Spec.Template.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: tc.affinity}}}
++			}
++			tmpl := &nodeClaimTemplate{requirements: tc.requirements, labels: tc.labels, spec: map[string]any{
++				"taints":        tc.taints,
++				"startupTaints": []any{map[string]any{"key": "startup", "effect": "NoSchedule"}},
++			}}
++			c := &Controller{APIReader: utiltesting.NewClientBuilder().WithObjects(ds).Build()}
++			got, err := c.daemonSetOverhead(t.Context(), tmpl)
++			if err != nil {
++				t.Fatal(err)
++			}
++			want := map[corev1.ResourceName]string{}
++			if tc.want {
++				want = map[corev1.ResourceName]string{corev1.ResourceCPU: "100m", corev1.ResourceMemory: "1Gi", corev1.ResourcePods: "1"}
++			}
++			assertOverhead(t, got, want)
++		})
++	}
++}
++
++func TestDaemonSetConstraintIntersection(t *testing.T) {
++	for name, tc := range map[string]struct {
++		requirements []corev1.NodeSelectorRequirement
++		want         bool
++	}{
++		"numeric interval": {requirements: []corev1.NodeSelectorRequirement{
++			{Key: "size", Operator: corev1.NodeSelectorOpGt, Values: []string{"4"}}, {Key: "size", Operator: corev1.NodeSelectorOpLt, Values: []string{"8"}},
++		}, want: true},
++		"numeric contradiction": {requirements: []corev1.NodeSelectorRequirement{
++			{Key: "size", Operator: corev1.NodeSelectorOpGt, Values: []string{"8"}}, {Key: "size", Operator: corev1.NodeSelectorOpLt, Values: []string{"8"}},
++		}},
++		"numeric allowed values": {requirements: []corev1.NodeSelectorRequirement{
++			{Key: "size", Operator: corev1.NodeSelectorOpIn, Values: []string{"4", "8"}}, {Key: "size", Operator: corev1.NodeSelectorOpGt, Values: []string{"4"}},
++		}, want: true},
++		"excluded allowed values": {requirements: []corev1.NodeSelectorRequirement{
++			{Key: "arch", Operator: corev1.NodeSelectorOpIn, Values: []string{"amd64"}}, {Key: "arch", Operator: corev1.NodeSelectorOpNotIn, Values: []string{"amd64"}},
++		}},
++		"presence contradiction": {requirements: []corev1.NodeSelectorRequirement{
++			{Key: "gpu", Operator: corev1.NodeSelectorOpExists}, {Key: "gpu", Operator: corev1.NodeSelectorOpDoesNotExist},
++		}},
++		"absence permitted": {requirements: []corev1.NodeSelectorRequirement{{Key: "gpu", Operator: corev1.NodeSelectorOpDoesNotExist}}, want: true},
++		"canonical numeric spelling excluded": {requirements: []corev1.NodeSelectorRequirement{
++			{Key: "size", Operator: corev1.NodeSelectorOpGt, Values: []string{"4"}}, {Key: "size", Operator: corev1.NodeSelectorOpLt, Values: []string{"6"}},
++			{Key: "size", Operator: corev1.NodeSelectorOpNotIn, Values: []string{"5"}},
++		}, want: true},
++	} {
++		t.Run(name, func(t *testing.T) {
++			got, err := selectorRequirementsCompatible(tc.requirements)
++			if err != nil || got != tc.want {
++				t.Fatalf("compatible = %v, %v; want %v", got, err, tc.want)
++			}
++		})
++	}
++	if _, err := selectorRequirementsCompatible([]corev1.NodeSelectorRequirement{{Key: "gpu", Operator: "unknown"}}); err == nil {
++		t.Fatal("invalid operator accepted")
++	}
++}
++
++func TestDaemonSetFieldConstraints(t *testing.T) {
++	name := strings.Repeat("node", 20) + ".example.com"
++	requirements := []corev1.NodeSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{name}}}
++	got, err := daemonSetFieldsCompatible(requirements)
++	if err != nil || !got {
++		t.Fatalf("valid long node name: compatible = %v, error = %v", got, err)
++	}
++	requirements = append(requirements, corev1.NodeSelectorRequirement{Key: "metadata.name", Operator: corev1.NodeSelectorOpNotIn, Values: []string{name}})
++	got, err = daemonSetFieldsCompatible(requirements)
++	if err != nil || got {
++		t.Fatalf("contradictory node names: compatible = %v, error = %v", got, err)
++	}
++	got, err = daemonSetFieldsCompatible(requirements[1:])
++	if err != nil || !got {
++		t.Fatalf("future node name: compatible = %v, error = %v", got, err)
++	}
++}
++
++type overheadFailingReader struct {
++	client.Reader
++	failPods bool
++}
++
++func (r overheadFailingReader) List(ctx context.Context, list client.ObjectList, options ...client.ListOption) error {
++	_, pods := list.(*corev1.PodList)
++	if pods == r.failPods {
++		return errors.New("public API unavailable")
++	}
++	return r.Reader.List(ctx, list, options...)
++}
++
++func TestDaemonSetOverheadReadFailure(t *testing.T) {
++	for _, failPods := range []bool{false, true} {
++		c := &Controller{APIReader: overheadFailingReader{Reader: utiltesting.NewClientBuilder().WithObjects(overheadDaemonSet("agent")).Build(), failPods: failPods}}
++		got, err := c.daemonSetOverhead(t.Context(), &nodeClaimTemplate{})
++		if err == nil || got != nil {
++			t.Fatalf("API failure returned requests %v, error %v", got, err)
++		}
++	}
++}
+diff --git a/config/components/rbac/role.yaml b/config/components/rbac/role.yaml
+--- a/config/components/rbac/role.yaml
++++ b/config/components/rbac/role.yaml
+@@ -104,6 +104,13 @@
+   verbs:
+   - get
+   - update
++- apiGroups:
++  - apps
++  resources:
++  - daemonsets
++  verbs:
++  - get
++  - list
+ - apiGroups:
+   - apps
+   resources:
+diff --git a/test/integration/singlecluster/tas/tas_karpenter_test.go b/test/integration/singlecluster/tas/tas_karpenter_test.go
+--- a/test/integration/singlecluster/tas/tas_karpenter_test.go
++++ b/test/integration/singlecluster/tas/tas_karpenter_test.go
+@@ -20,11 +20,14 @@
+ 	"context"
+ 	"fmt"
+ 	"strconv"
++	"strings"
+ 
+ 	"github.com/onsi/ginkgo/v2"
+ 	"github.com/onsi/gomega"
++	appsv1 "k8s.io/api/apps/v1"
+ 	corev1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/api/resource"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+ 	"k8s.io/apimachinery/pkg/runtime/schema"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+@@ -50,6 +53,7 @@
+ 	var cq *kueue.ClusterQueue
+ 	var pool *unstructured.Unstructured
+ 	var nodes []corev1.Node
++	var daemon *appsv1.DaemonSet
+ 	claimGVK := schema.GroupVersionKind{Group: "karpenter.sh", Version: "v1", Kind: "NodeClaim"}
+ 	listClaims := func() []unstructured.Unstructured {
+ 		list := &unstructured.UnstructuredList{}
+@@ -67,6 +71,7 @@
+ 		ginkgo.DeferCleanup(func() { fwk.StopManager(ctx) })
+ 		ns = behavioral.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "karpenter-tas-")
+ 		nodes = nil
++		daemon = nil
+ 		topology = utiltestingapi.MakeDefaultOneLevelTopology("karpenter-topology")
+ 		flavor = utiltestingapi.MakeResourceFlavor("karpenter-tas").NodeLabel(karpenter.NodePoolLabelKey, "tas-pool").TopologyName(topology.Name).Obj()
+ 		reserved = utiltestingapi.MakeResourceFlavor("reserved-tas").NodeLabel("capacity", "reserved").TopologyName(topology.Name).Obj()
+@@ -92,6 +97,9 @@
+ 		behavioral.MustCreate(ctx, k8sClient, utiltestingapi.MakeLocalQueue("lq", ns.Name).ClusterQueue(cq.Name).Obj())
+ 	})
+ 	ginkgo.AfterEach(func() {
++		if daemon != nil {
++			gomega.Expect(k8sClient.Delete(ctx, daemon)).To(gomega.Succeed())
++		}
+ 		gomega.Expect(behavioral.DeleteWorkloadsInNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
+ 		gomega.Eventually(listClaims, behavioral.MediumTimeout, behavioral.Interval).Should(gomega.BeEmpty())
+ 		gomega.Expect(forceDeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
+@@ -155,6 +163,67 @@
+ 		}
+ 		gomega.Expect(admissioncheck.FindAdmissionCheck(wl.Status.AdmissionChecks, kueue.AdmissionCheckReference(ac.Name)).PodSetUpdates).To(gomega.HaveLen(1))
+ 	})
++
++	ginkgo.It("creates label-compatible long identities and reserves admitted daemon overhead without changing workers", func() {
++		gomega.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(cq), cq)).To(gomega.Succeed())
++		cq.Spec.ResourceGroups = utiltestingapi.MakeClusterQueue(cq.Name).ResourceGroup(
++			*utiltestingapi.MakeFlavorQuotas(flavor.Name).Resource(corev1.ResourceCPU, "10").Resource(corev1.ResourceMemory, "100Gi").Resource("nvidia.com/gpu", "10").Obj(),
++		).Obj().Spec.ResourceGroups
++		gomega.Expect(k8sClient.Update(ctx, cq)).To(gomega.Succeed())
++		daemon = &appsv1.DaemonSet{
++			ObjectMeta: metav1.ObjectMeta{Name: "node-agent", Namespace: ns.Name},
++			Spec: appsv1.DaemonSetSpec{
++				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "node-agent"}},
++				Template: corev1.PodTemplateSpec{
++					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "node-agent"}},
++					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "agent", Image: "registry.k8s.io/pause:3.10", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
++						corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("1Gi"),
++					}}}}},
++				},
++			},
++		}
++		behavioral.MustCreate(ctx, k8sClient, daemon)
++		admitted := &corev1.Pod{
++			ObjectMeta: metav1.ObjectMeta{Name: "admitted-agent", Namespace: ns.Name, Labels: daemon.Spec.Template.Labels,
++				OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: daemon.Name, UID: daemon.UID, Controller: new(true)}}},
++			Spec: *daemon.Spec.Template.Spec.DeepCopy(),
++		}
++		admitted.Spec.Containers[0].Resources.Requests = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("5Gi")}
++		admitted.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
++			MatchFields: []corev1.NodeSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"existing-node"}}},
++		}}}}}
++		behavioral.MustCreate(ctx, k8sClient, admitted)
++		wl := utiltestingapi.MakeWorkload(strings.Repeat("w", 63), ns.Name).Queue("lq").PodSets(
++			*utiltestingapi.MakePodSet(kueue.PodSetReference(strings.Repeat("p", 63)), 1).Request(corev1.ResourceCPU, "3").Request(corev1.ResourceMemory, "12Gi").Request("nvidia.com/gpu", "1").UnconstrainedTopologyRequest().Obj(),
++		).Obj()
++		behavioral.MustCreate(ctx, k8sClient, wl)
++		behavioral.ExpectWorkloadsToHaveQuotaReservation(ctx, k8sClient, cq.Name, wl)
++		gomega.Eventually(listClaims, behavioral.Timeout, behavioral.Interval).Should(gomega.HaveLen(1))
++		claim := listClaims()[0]
++		gomega.Expect(len(claim.GetName())).To(gomega.BeNumerically("<=", 63))
++		labels := claim.GetLabels()
++		for _, value := range labels {
++			gomega.Expect(len(value)).To(gomega.BeNumerically("<=", 63))
++		}
++		labels["provider.example.com/claim-name"] = claim.GetName()
++		claim.SetLabels(labels)
++		// The API server must accept the same name-valued label a provider writes during reconciliation.
++		gomega.Expect(k8sClient.Update(ctx, &claim)).To(gomega.Succeed())
++		requests, found, err := unstructured.NestedStringMap(claim.Object, "spec", "resources", "requests")
++		gomega.Expect(err).NotTo(gomega.HaveOccurred())
++		gomega.Expect(found).To(gomega.BeTrue())
++		for key, text := range map[string]string{"cpu": "3500m", "memory": "17Gi", "nvidia.com/gpu": "1", "pods": "2"} {
++			got := resource.MustParse(requests[key])
++			gomega.Expect(got.Cmp(resource.MustParse(text))).To(gomega.BeZero(), "request %s", key)
++		}
++		gomega.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), wl)).To(gomega.Succeed())
++		worker := wl.Spec.PodSets[0].Template.Spec.Containers[0].Resources.Requests
++		gomega.Expect(worker.Cpu().Cmp(resource.MustParse("3"))).To(gomega.BeZero())
++		gomega.Expect(worker.Memory().Cmp(resource.MustParse("12Gi"))).To(gomega.BeZero())
++		gpu := worker["nvidia.com/gpu"]
++		gomega.Expect(gpu.Cmp(resource.MustParse("1"))).To(gomega.BeZero())
++	})
++
+ 	ginkgo.It("times out unregistered capacity and falls back to an existing-node flavor even with a queue-wide check", func() {
+ 		gomega.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ac), ac)).To(gomega.Succeed())
+ 		ac.Annotations[karpenter.LaunchTimeoutAnnotation] = "5s"
