@@ -6,13 +6,25 @@ on:
   pull_request:
     branches: [ main, release-please--branches--main, redesign/partial-preemption ]
 
+permissions:
+  contents: read
+
 jobs:
+  publishing-boundary:
+    name: Check Publishing Boundary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: python3 tests/release/check-publishing-boundary.py
+
   validate-patches:
     name: Validate Upstream Patch Rebase
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Git
         run: |
@@ -80,7 +92,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Check The Ray Release Stays A Draft Until Its Assets Are Uploaded
         run: tests/release/check-ray-release-order.sh
@@ -92,7 +104,7 @@ jobs:
       matrix: ${{ steps.variants.outputs.matrix }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Read Variants
         id: variants
@@ -110,7 +122,7 @@ jobs:
       RAY_VARIANT: ${{ matrix.variant }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Free Disk Space for the CUDA Base Image
         if: ${{ matrix.variant != '' }}
@@ -119,7 +131,7 @@ jobs:
           df -h /
 
       - name: Install Mise
-        uses: jdx/mise-action@v5
+        uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5
 
       - name: Run Patched Ray Unit Tests
         run: mise run test:ray
@@ -130,10 +142,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Mise
-        uses: jdx/mise-action@v5
+        uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5
 
       - name: Run Patched Kueue Unit Tests
         run: mise run test:kueue
@@ -144,10 +156,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Mise
-        uses: jdx/mise-action@v5
+        uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5
 
       - name: Run Patched Kueue Integration Tests
         run: mise run test:kueue-integration
@@ -158,10 +170,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Mise
-        uses: jdx/mise-action@v5
+        uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5
 
       - name: Run Patched KubeRay Unit Tests
         run: mise run test:kuberay
@@ -172,10 +184,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Mise
-        uses: jdx/mise-action@v5
+        uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5
 
       - name: Run Patched Virtual Kubelet Unit Tests
         run: mise run test:interlink
@@ -202,22 +214,22 @@ jobs:
       CHAINSAW_SELECTOR: ${{ matrix.selector }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: "1.27"
           cache: true
 
       - name: Install Ko
-        uses: ko-build/setup-ko@v0.10
+        uses: ko-build/setup-ko@61b4d1d396f5b2e7d6bb6fefdce3dc38d1a13445 # v0.10
 
       - name: Set up Chainsaw
-        uses: kyverno/action-install-chainsaw@v0.2.15
+        uses: kyverno/action-install-chainsaw@1223ef75bedeb59c4e7b5455463d4316e76dff01 # v0.2.15
 
       - name: Install Mise
-        uses: jdx/mise-action@v5
+        uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5
 
       - name: Spin up Cluster and Deploy Patched Controllers
         run: mise run cluster:up
