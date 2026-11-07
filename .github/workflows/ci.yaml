@@ -1,3 +1,5 @@
+# Validate patch applicability, publication ownership, release ordering, and the patched components' unit and integration behavior.
+
 name: CI
 
 on:
@@ -7,6 +9,25 @@ on:
     branches: [ main, release-please--branches--main, redesign/partial-preemption ]
 
 jobs:
+  publication-namespace:
+    name: Check Publication Namespace
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Mise
+        uses: jdx/mise-action@v5
+
+      - name: Check Local Publication Defaults
+        run: env -u GITHUB_REPOSITORY -u GITHUB_REPOSITORY_OWNER mise exec -- python3 tests/release/check-publication-namespace.py
+
+      - name: Check Repository and Registry Ownership
+        env:
+          GITHUB_REPOSITORY: example-owner/example-project
+          GITHUB_REPOSITORY_OWNER: example-registry
+        run: mise exec -- python3 tests/release/check-publication-namespace.py
+
   validate-patches:
     name: Validate Upstream Patch Rebase
     runs-on: ubuntu-latest

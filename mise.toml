@@ -1,3 +1,5 @@
+# Pin toolchains and upstream patch versions, build and test patched components, and publish their images and Ray wheels.
+
 [tools]
 go = "1.27.3"
 kind = "0.33.0"
@@ -10,6 +12,10 @@ docker-cli = "29.9.3"
 
 [env]
 CLUSTER_NAME = "elastic-scale-lab"
+
+# Publishing follows the current CI repository; local publication targets the organization fork.
+PUBLISH_REPOSITORY = "{{ get_env(name='GITHUB_REPOSITORY', default='boltz-bio/elastic-kueue-kuberay-patches') }}"
+PUBLISH_OWNER = "{{ get_env(name='GITHUB_REPOSITORY_OWNER', default='boltz-bio') }}"
 
 # Upstream versions
 # renovate: datasource=github-releases depName=kubernetes-sigs/kueue
@@ -43,7 +49,7 @@ RAY_IMAGE_TAG = "{{env.RAY_UPSTREAM}}-{{env.RAY_PYTHON}}{{env.RAY_VARIANT}}-p{{e
 
 # The patched Ray wheel: its PEP 440 local version and the release that carries it.
 RAY_LOCAL_VERSION = "{{env.RAY_UPSTREAM}}+p{{env.RAY_PATCH_VERSION}}"
-RAY_WHEEL_BASE_URL = "https://github.com/simonepri/elastic-kueue-kuberay-patches/releases/download/ray-v{{env.RAY_PATCH_VERSION}}"
+RAY_WHEEL_BASE_URL = "https://github.com/{{env.PUBLISH_REPOSITORY}}/releases/download/ray-v{{env.RAY_PATCH_VERSION}}"
 # "1" installs the patched wheel into the Ray image; otherwise the image only overlays the patched Python files.
 # RAY_WHEEL_DIR, when set, supplies the wheel from a local directory instead of the release, and
 # RAY_WHEEL_SERVER_URL from another server (CI serves the wheel it just built).
@@ -317,11 +323,11 @@ description = "Build and publish patched Kueue multi-arch image to GHCR"
 depends = ["patch:kueue"]
 run = """
 TAG="${KUEUE_UPSTREAM}-p${KUEUE_PATCH_VERSION}"
-echo "Publishing Kueue image ghcr.io/simonepri/kueue:$TAG..."
+echo "Publishing Kueue image ghcr.io/${PUBLISH_OWNER}/kueue:$TAG..."
 docker buildx build --platform linux/amd64,linux/arm64 \
   -f docker/kueue.Dockerfile \
-  -t "ghcr.io/simonepri/kueue:$TAG" \
-  -t "ghcr.io/simonepri/kueue:latest" \
+  -t "ghcr.io/${PUBLISH_OWNER}/kueue:$TAG" \
+  -t "ghcr.io/${PUBLISH_OWNER}/kueue:latest" \
   --push \
   third_party/kueue
 """
@@ -331,11 +337,11 @@ description = "Build and publish patched KubeRay multi-arch image to GHCR"
 depends = ["patch:kuberay"]
 run = """
 TAG="${KUBERAY_UPSTREAM}-p${KUBERAY_PATCH_VERSION}"
-echo "Publishing KubeRay image ghcr.io/simonepri/kuberay-operator:$TAG..."
+echo "Publishing KubeRay image ghcr.io/${PUBLISH_OWNER}/kuberay-operator:$TAG..."
 docker buildx build --platform linux/amd64,linux/arm64 \
   -f docker/kuberay.Dockerfile \
-  -t "ghcr.io/simonepri/kuberay-operator:$TAG" \
-  -t "ghcr.io/simonepri/kuberay-operator:latest" \
+  -t "ghcr.io/${PUBLISH_OWNER}/kuberay-operator:$TAG" \
+  -t "ghcr.io/${PUBLISH_OWNER}/kuberay-operator:latest" \
   --push \
   third_party/kuberay/ray-operator
 """
@@ -345,12 +351,12 @@ description = "Build and publish patched interLink virtual kubelet multi-arch im
 depends = ["patch:interlink"]
 run = """
 TAG="${INTERLINK_UPSTREAM}-p${INTERLINK_PATCH_VERSION}"
-echo "Publishing interLink virtual kubelet image ghcr.io/simonepri/interlink-virtual-kubelet:$TAG..."
+echo "Publishing interLink virtual kubelet image ghcr.io/${PUBLISH_OWNER}/interlink-virtual-kubelet:$TAG..."
 docker buildx build --platform linux/amd64,linux/arm64 \
   -f docker/interlink.Dockerfile \
   --build-arg VERSION="$TAG" \
-  -t "ghcr.io/simonepri/interlink-virtual-kubelet:$TAG" \
-  -t "ghcr.io/simonepri/interlink-virtual-kubelet:latest" \
+  -t "ghcr.io/${PUBLISH_OWNER}/interlink-virtual-kubelet:$TAG" \
+  -t "ghcr.io/${PUBLISH_OWNER}/interlink-virtual-kubelet:latest" \
   --push \
   third_party/interlink
 """
@@ -359,12 +365,12 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 description = "Build and publish the patched Ray image for RAY_VARIANT on RAY_PLATFORMS to GHCR"
 depends = ["patch:ray"]
 run = """
-echo "Publishing Ray image ghcr.io/simonepri/ray:$RAY_IMAGE_TAG from $RAY_BASE_IMAGE for $RAY_PLATFORMS..."
+echo "Publishing Ray image ghcr.io/${PUBLISH_OWNER}/ray:$RAY_IMAGE_TAG from $RAY_BASE_IMAGE for $RAY_PLATFORMS..."
 docker buildx build --platform "$RAY_PLATFORMS" \
   -f docker/ray.Dockerfile \
   --build-arg BASE_IMAGE="$RAY_BASE_IMAGE" \
   $(mise run ray:wheel-args) \
-  -t "ghcr.io/simonepri/ray:$RAY_IMAGE_TAG" \
+  -t "ghcr.io/${PUBLISH_OWNER}/ray:$RAY_IMAGE_TAG" \
   --push \
   third_party/ray
 """
